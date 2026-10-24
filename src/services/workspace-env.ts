@@ -1919,9 +1919,14 @@ function untrustedInstallInterpreterReason(python: string, detail: string): stri
  * nested independent checkout with that bundle layout. */
 function targetsLiveInstall(serverRoot: string, requestedRoot: string | undefined): boolean {
   if (!requestedRoot) return true;
-  const server = pathResolve(serverRoot);
-  const requested = pathResolve(requestedRoot);
-  return server === requested || (server.startsWith(requested + sep) && !hasMainPy(requested));
+  // Both sides in the SAME canonical spelling: the server root is realpath'd (ComfyUI
+  // anchors on os.path.realpath(__file__)), so comparing it with the lexical request
+  // called one install reached through an alias (macOS /var → /private/var, a
+  // symlinked home, a junction) "a different install" and refused before any
+  // interpreter evidence was examined.
+  const server = canonicalRoot(serverRoot);
+  const requested = canonicalRoot(requestedRoot);
+  return server === requested || (server.startsWith(requested + sep) && !hasMainPy(requestedRoot));
 }
 
 /**
