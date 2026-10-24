@@ -32,8 +32,11 @@ export interface DatasetDetail extends DatasetSummary {
  *  against and fails later with an honest not-found. Resolving it lexically
  *  instead compared "/var/…/datasets/x" with "/private/var/…/datasets" under any
  *  aliased root (macOS temp, a symlinked home, a Windows junction) and reported an
- *  ordinary unknown name as an ESCAPE. The absent tail cannot itself be a link.
- *  Any other realpath failure keeps the lexical form, as before. */
+ *  ordinary unknown name as an ESCAPE. An ENOENT tail is not proof that no link
+ *  is involved — a DANGLING symlink also reports ENOENT, and its eventual target
+ *  is not resolved here; such a path has nothing to read now, and callers still
+ *  stat/read it and fail on absence. Any other realpath failure keeps the lexical
+ *  form, as before. */
 function realOrLexical(p: string): string {
   const abs = resolve(p);
   const tail: string[] = [];

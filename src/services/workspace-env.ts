@@ -1919,14 +1919,30 @@ function untrustedInstallInterpreterReason(python: string, detail: string): stri
  * nested independent checkout with that bundle layout. */
 function targetsLiveInstall(serverRoot: string, requestedRoot: string | undefined): boolean {
   if (!requestedRoot) return true;
-  // Both sides in the SAME canonical spelling: the server root is realpath'd (ComfyUI
+  // Both sides in the SAME realpath'd spelling: the server root is realpath'd (ComfyUI
   // anchors on os.path.realpath(__file__)), so comparing it with the lexical request
   // called one install reached through an alias (macOS /var → /private/var, a
   // symlinked home, a junction) "a different install" and refused before any
   // interpreter evidence was examined.
-  const server = canonicalRoot(serverRoot);
-  const requested = canonicalRoot(requestedRoot);
+  const server = installIdentitySpelling(serverRoot);
+  const requested = installIdentitySpelling(requestedRoot);
   return server === requested || (server.startsWith(requested + sep) && !hasMainPy(requestedRoot));
+}
+
+/** realpath'd spelling for {@link targetsLiveInstall}. Unlike `canonicalRoot`, case
+ *  is folded on Windows ONLY: this check AUTHORIZES handing out the live server's
+ *  interpreter for the requested root, and on a case-sensitive macOS volume
+ *  `/work/ComfyUI` and `/work/comfyui` are two installs that realpath leaves
+ *  distinct — folding would call them one. Two spellings that realpath does not
+ *  unify on macOS are refused, the safe direction for this check. */
+function installIdentitySpelling(p: string): string {
+  let out = pathResolve(p);
+  try {
+    out = realpathSync(out);
+  } catch {
+    /* unresolvable — compare the lexical form */
+  }
+  return platform() === "win32" ? out.toLowerCase() : out;
 }
 
 /**
