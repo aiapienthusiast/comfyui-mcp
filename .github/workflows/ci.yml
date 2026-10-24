@@ -8,7 +8,7 @@ on:
 
 jobs:
   build:
-    runs-on: ubuntu-latest
+    runs-on: ${{ matrix.os }}
     strategy:
       matrix:
         os: [ubuntu-latest, windows-latest, macos-latest]
@@ -42,8 +42,7 @@ jobs:
       # model to call something that now 404s, which the model can't diagnose and
       # the user experiences as a broken feature. Deliberately unconditional so it
       # runs on every matrix leg: it is pure text analysis over `git ls-files`, and
-      # a path-separator or encoding difference is worth catching. (That only
-      # becomes real once the matrix actually varies the OS — comfyui-mcp-bi9.)
+      # a path-separator or encoding difference is worth catching.
       - run: npm run check:vocabulary
 
       # #796 — the "could not determine" -> "determined not" collapse. A caught
@@ -74,9 +73,7 @@ jobs:
       # this check was added (five pages had drifted behind description edits),
       # which is exactly why it exists.
       # Ubuntu only: generation is OS-independent, and a CRLF checkout on Windows
-      # would produce a spurious whole-file diff. (Note: every matrix leg is
-      # currently Ubuntu anyway — see comfyui-mcp-bi9 — so this condition is
-      # correct in intent and a no-op in effect until that is fixed.)
+      # would produce a spurious whole-file diff.
       - name: Tool Reference is current (docs:gen must be a no-op)
         if: matrix.os == 'ubuntu-latest'
         run: |
