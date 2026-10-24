@@ -1,13 +1,5 @@
 # comfyui-mcp — drive ComfyUI with ANY LLM
 
-> [!NOTE]
-> **Limited maintenance has resumed.** We support the local Agent Panel and your choice of
-> provider, including offline models. Releases focus on verified critical fixes; there is
-> no broad feature roadmap. Automatic issue reporting remains disabled.
->
-> We will reassess support when Comfy’s official local panel becomes publicly available.
-> [Maintenance update](https://comfyui-mcp.artokun.io/docs/blog/goodbye).
-
 <p align="center">
   <a href="https://comfyui-mcp.artokun.io/docs">
     <img src="docs/images/demo-poster.jpg" width="760"
