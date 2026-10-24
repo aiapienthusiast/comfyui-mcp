@@ -5640,7 +5640,12 @@ function inspectNewRegistryPack(
     }
     // Reject junctions and other directory indirections too. The panel's local
     // proof must describe the directory Manager just populated, not another tree.
-    if (!sameFilesystemPath(realpathSync(dir), dir)) {
+    // Compared against the pack spelled through the CANONICAL scan base: an alias
+    // ABOVE the base (macOS /var → /private/var, a junctioned or symlinked install
+    // root) is a second spelling of the same tree, and comparing against the
+    // as-given spelling refused every pack under it. An indirection at custom_nodes
+    // or at the pack itself still differs and is still refused.
+    if (!sameFilesystemPath(realpathSync(dir), join(realpathSync(scanBase), "custom_nodes", entry.name))) {
       return { state: "not-found", scanned: customNodes };
     }
 
