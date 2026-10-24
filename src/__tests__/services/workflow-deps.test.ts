@@ -256,10 +256,11 @@ describe("extractWorkflowDependencies", () => {
     });
     const wf: WorkflowJSON = { "1": { class_type: "WasImageThing", inputs: {} } };
     const result = await extractWorkflowDependencies(wf, deps);
+    // #2765 — a pattern match is an inference, not a listing, and is labelled as one.
     expect(result.dependencies[0]).toMatchObject({
       pack: "Pattern-Pack",
       installed: false,
-      source: "manager_mappings",
+      source: "manager_pattern",
     });
   });
 

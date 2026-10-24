@@ -71,8 +71,24 @@ export interface NodeDependency {
   builtin: boolean;
   /** True when the node is currently installed/available on the server. */
   installed: boolean;
-  /** How the pack was resolved (for transparency). */
-  source: "object_info" | "manager_mappings" | "unresolved";
+  /**
+   * How the pack was resolved (for transparency). `manager_mappings` means a catalogue
+   * entry LISTS this class by name; `manager_pattern` means only a pack's
+   * `nodename_pattern` matched it — a naming convention, inferred rather than listed.
+   */
+  source: "object_info" | "manager_mappings" | "manager_pattern" | "unresolved";
+  /**
+   * #2765 — set when the catalogue names more than one repository for this class and
+   * nothing here can tell which is right. `pack` is then null: picking one would be a guess.
+   */
+  claimants?: string[];
+}
+
+/** #2765 — a class_type the catalogue attributes to several repositories. */
+export interface AmbiguousOwnership {
+  class_type: string;
+  /** Catalogue keys (repository URL or registry id) of every claimant, sorted. */
+  claimants: string[];
 }
 
 export interface ExtractDepsResult {
@@ -86,6 +102,11 @@ export interface ExtractDepsResult {
   missingPacks: string[];
   /** class_types that could not be mapped to any pack. */
   unresolved: string[];
+  /**
+   * #2765 — the subset of `unresolved` that IS known to the catalogue, but to more than
+   * one repository. Present only when non-empty.
+   */
+  ambiguous?: AmbiguousOwnership[];
   /**
    * #1136 — set when the Manager MAPPINGS lookup did not actually answer, which
    * makes `unresolved` unsafe to read as "not known to ComfyUI-Manager".
@@ -112,6 +133,8 @@ export interface InstallDepsResult {
   alreadyInstalled: string[];
   /** Required class_types whose pack could not be resolved (cannot install). */
   unresolved: string[];
+  /** #2765 — the analysis's `ambiguous`, carried through: claimed by several repositories, so not queued. */
+  ambiguous?: AmbiguousOwnership[];
   /** Queue status after processing, if available. */
   queue?: ManagerQueueStatus;
   /**
@@ -326,44 +349,133 @@ function packFromPythonModule(pythonModule: string | undefined): {
   return { builtin: false, pack: pythonModule.split(".")[0] || null };
 }
 
-/** Build a class_type -> pack lookup from Manager mappings (incl. regex patterns). */
-function buildMappingIndex(mappings: ManagerMappings): {
-  exact: Map<string, string>;
-  patterns: Array<{ re: RegExp; pack: string }>;
-} {
-  const exact = new Map<string, string>();
-  const patterns: Array<{ re: RegExp; pack: string }> = [];
+/**
+ * #2765 — a `nodename_pattern` is a naming convention a pack publishes, not an ownership
+ * record: anyone may publish one about anyone. A pattern that matches this string
+ * constrains nothing (`.*`, `^`, `.?`) and so attributes nothing. One catalogue entry
+ * published `.*` with no listed classes and was named the owner of every class the
+ * catalogue did not list.
+ */
+const CATCH_ALL_PROBE = "\u0000comfyui-mcp:no-pack-names-this\u0000";
+
+/** Class_type -> claimant lookup from Manager mappings, keyed by catalogue key (repo URL or registry id). */
+interface MappingIndex {
+  /** class_type -> every catalogue key that LISTS it. */
+  exact: Map<string, Set<string>>;
+  patterns: Array<{ re: RegExp; repo: string; overBroad?: boolean }>;
+  /** catalogue key -> the pack name this module reports (Manager title, else the key). */
+  names: Map<string, string>;
+}
+
+function buildMappingIndex(mappings: ManagerMappings): MappingIndex {
+  const exact = new Map<string, Set<string>>();
+  const patterns: MappingIndex["patterns"] = [];
+  const names = new Map<string, string>();
   for (const [repoOrId, value] of Object.entries(mappings)) {
     if (!Array.isArray(value)) continue;
     const [classNames, meta] = value;
-    const pack = (meta && meta.title) || repoOrId;
+    names.set(repoOrId, (meta && meta.title) || repoOrId);
     if (Array.isArray(classNames)) {
       for (const cn of classNames) {
-        if (typeof cn === "string" && !exact.has(cn)) exact.set(cn, pack);
+        if (typeof cn !== "string") continue;
+        const owners = exact.get(cn) ?? new Set<string>();
+        owners.add(repoOrId);
+        exact.set(cn, owners);
       }
     }
     const pattern = meta?.nodename_pattern;
     if (typeof pattern === "string" && pattern) {
+      let re: RegExp;
       try {
-        patterns.push({ re: new RegExp(pattern), pack });
+        re = new RegExp(pattern);
       } catch {
         // Ignore malformed patterns from the Manager DB.
+        continue;
       }
+      if (!re.test(CATCH_ALL_PROBE)) patterns.push({ re, repo: repoOrId });
     }
   }
-  return { exact, patterns };
+  return { exact, patterns, names };
 }
 
-function resolveFromMappings(
-  classType: string,
-  index: { exact: Map<string, string>; patterns: Array<{ re: RegExp; pack: string }> },
-): string | null {
-  const exact = index.exact.get(classType);
-  if (exact) return exact;
-  for (const { re, pack } of index.patterns) {
-    if (re.test(classType)) return pack;
+/**
+ * Manager applies patterns as a SEARCH (`regex.test` in its missing-node finder,
+ * `re.search` in its workflow scan), so `" \(rgthree\)$"` stays a suffix convention.
+ * What bounds a pattern is the catalogue itself: one matching classes that two or more
+ * OTHER repositories list is demonstrably not one pack's convention (`Hunyuan` matched
+ * 185 classes of 45 other packs). A single collision does not discard it — that is two
+ * sources disagreeing, and resolveFromMappings reports it as ambiguous instead.
+ * Computed lazily: only patterns that match a workflow class are ever measured.
+ */
+function isOverBroad(p: MappingIndex["patterns"][number], index: MappingIndex): boolean {
+  if (p.overBroad !== undefined) return p.overBroad;
+  const foreign = new Set<string>();
+  for (const [cn, owners] of index.exact) {
+    if (owners.has(p.repo) || !p.re.test(cn)) continue;
+    for (const o of owners) foreign.add(o);
+    if (foreign.size >= 2) break;
   }
-  return null;
+  p.overBroad = foreign.size >= 2;
+  return p.overBroad;
+}
+
+/** Every repository the catalogue offers for a class: by listing, and by bounded pattern. */
+function catalogueClaims(
+  classType: string,
+  index: MappingIndex,
+): { listed: Set<string>; matched: Set<string> } {
+  const listed = index.exact.get(classType) ?? new Set<string>();
+  const matched = new Set<string>();
+  for (const p of index.patterns) {
+    if (p.re.test(classType) && !isOverBroad(p, index)) matched.add(p.repo);
+  }
+  return { listed, matched };
+}
+
+type MappingResolution =
+  | { kind: "none" }
+  | { kind: "owner"; repo: string; via: "exact" | "pattern" }
+  | { kind: "ambiguous"; claimants: string[] };
+
+/**
+ * #2765 — name an owner only when the catalogue names exactly one. A listing outranks a
+ * convention, unless the convention comes from a repository that lists nothing here,
+ * which is two sources disagreeing. A pattern a second pack copied (`- Ostris$`, `_jru$`)
+ * is not independent when one of the listers publishes it too. Never first-wins.
+ */
+function resolveFromMappings(classType: string, index: MappingIndex): MappingResolution {
+  const { listed, matched } = catalogueClaims(classType, index);
+  const corroborated = [...matched].some((r) => listed.has(r));
+  if (listed.size > 0) {
+    const dissent = corroborated ? [] : [...matched];
+    const claimants = [...new Set([...listed, ...dissent])].sort();
+    return claimants.length === 1
+      ? { kind: "owner", repo: claimants[0], via: "exact" }
+      : { kind: "ambiguous", claimants };
+  }
+  const claimants = [...matched].sort();
+  if (claimants.length === 0) return { kind: "none" };
+  return claimants.length === 1
+    ? { kind: "owner", repo: claimants[0], via: "pattern" }
+    : { kind: "ambiguous", claimants };
+}
+
+/** Directory-name form of a catalogue key (repo URL or registry id). */
+function dirKey(key: string): string {
+  const seg = key.replace(/\/+$/, "").replace(/\.git$/i, "").split("/").pop() ?? "";
+  return seg.toLowerCase().replace(/_/g, "-");
+}
+
+/**
+ * #2765 — an installed node is owned by the directory it loaded from; that is the one
+ * fact the catalogue cannot launder (Manager's getmappings appends installed-but-unlisted
+ * classes to every pack whose pattern matches them). Manager's friendlier title is kept
+ * only when exactly one claimant IS that directory.
+ */
+function nameForInstalledDir(classType: string, packDir: string, index: MappingIndex): string {
+  const { listed, matched } = catalogueClaims(classType, index);
+  const same = [...new Set([...listed, ...matched])].filter((r) => dirKey(r) === dirKey(packDir));
+  return same.length === 1 ? (index.names.get(same[0]) ?? packDir) : packDir;
 }
 
 /**
@@ -383,10 +495,7 @@ export async function extractWorkflowDependencies(
 
   // Manager mappings are best-effort: extraction must still work if Manager
   // is absent, falling back to object_info's python_module for installed nodes.
-  let mappingIndex: ReturnType<typeof buildMappingIndex> = {
-    exact: new Map(),
-    patterns: [],
-  };
+  let mappingIndex: MappingIndex = { exact: new Map(), patterns: [], names: new Map() };
   // #1136 — this catch used to be the whole story: log at warn, carry on, and
   // let every unmapped class_type render as "neither installed nor known to
   // ComfyUI-Manager". We KNOW Manager was never consulted -- we are holding the
@@ -434,33 +543,39 @@ export async function extractWorkflowDependencies(
         dependencies.push({ class_type: classType, pack: null, builtin: true, installed: true, source: "object_info" });
         continue;
       }
-      // Installed custom node: prefer Manager's friendly pack name when available,
-      // otherwise use the python_module-derived directory name.
-      const mappedPack = resolveFromMappings(classType, mappingIndex);
-      dependencies.push({
-        class_type: classType,
-        pack: mappedPack ?? pack,
-        builtin: false,
-        installed: true,
-        source: mappedPack ? "manager_mappings" : "object_info",
-      });
-      continue;
+      if (pack) {
+        dependencies.push({
+          class_type: classType,
+          pack: nameForInstalledDir(classType, pack, mappingIndex),
+          builtin: false,
+          installed: true,
+          source: "object_info",
+        });
+        continue;
+      }
+      // Installed, but /object_info gave no usable python_module: the catalogue is all
+      // there is, under the same rules as a node that is not installed.
     }
 
-    // Not installed: only the Manager mapping can tell us the owning pack.
-    const mappedPack = resolveFromMappings(classType, mappingIndex);
+    const resolution = resolveFromMappings(classType, mappingIndex);
+    const fallback = installed ? "object_info" : "unresolved";
     dependencies.push({
       class_type: classType,
-      pack: mappedPack,
+      pack: resolution.kind === "owner" ? (mappingIndex.names.get(resolution.repo) ?? resolution.repo) : null,
       builtin: false,
-      installed: false,
-      source: mappedPack ? "manager_mappings" : "unresolved",
+      installed,
+      source:
+        resolution.kind === "owner"
+          ? resolution.via === "exact" ? "manager_mappings" : "manager_pattern"
+          : fallback,
+      ...(resolution.kind === "ambiguous" ? { claimants: resolution.claimants } : {}),
     });
   }
 
   const requiredPackSet = new Set<string>();
   const missingPackSet = new Set<string>();
   const unresolved: string[] = [];
+  const ambiguous: AmbiguousOwnership[] = [];
 
   for (const dep of dependencies) {
     if (dep.builtin) continue;
@@ -469,6 +584,7 @@ export async function extractWorkflowDependencies(
       if (!dep.installed) missingPackSet.add(dep.pack);
     } else if (!dep.installed) {
       unresolved.push(dep.class_type);
+      if (dep.claimants) ambiguous.push({ class_type: dep.class_type, claimants: dep.claimants });
     }
   }
 
@@ -478,6 +594,8 @@ export async function extractWorkflowDependencies(
     requiredPacks: [...requiredPackSet].sort(),
     missingPacks: [...missingPackSet].sort(),
     unresolved: unresolved.sort(),
+    // dependencies follow the sorted classTypes, so this is already in class_type order.
+    ...(ambiguous.length > 0 ? { ambiguous } : {}),
     ...(mappingsUnavailable && unresolved.length > 0
       ? { mappings_unavailable: mappingsUnavailable }
       : {}),
@@ -512,6 +630,7 @@ export async function installWorkflowDependencies(
       installed: [],
       alreadyInstalled: analysis.requiredPacks,
       unresolved: analysis.unresolved,
+      ...(analysis.ambiguous ? { ambiguous: analysis.ambiguous } : {}),
       // panel#890 (codex round 2, P1) — this early return emits `unresolved` too, and
       // it used to emit it BARE. Nothing is installed on this path, so it reads as the
       // most settled answer of the three, and "not found in ComfyUI-Manager" with no
@@ -647,6 +766,7 @@ export async function installWorkflowDependenciesForAnalysis(
     installed: installed.sort(),
     alreadyInstalled: analysis.requiredPacks.filter((p) => !missingSet.has(p)),
     unresolved: [...new Set(unresolved)].sort(),
+    ...(analysis.ambiguous ? { ambiguous: analysis.ambiguous } : {}),
     queue,
     // Gated on there being something to mislead about. Round 3 caught a comment
     // here claiming this gate existed when it did not -- the field's own
