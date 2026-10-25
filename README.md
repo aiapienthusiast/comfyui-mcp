@@ -375,8 +375,9 @@ Install [comfy-cli](https://docs.comfy.org/comfy-cli/getting-started#install-cli
 | Tool | Description |
 |------|-------------|
 | `restart_comfyui` `action:"restart"` | Stop and restart ComfyUI, preserving all launch arguments |
-| `restart_comfyui` `action:"stop"` | Stop the running ComfyUI process (saves PID and launch args for restart) |
-| `restart_comfyui` `action:"start"` | Start ComfyUI using info saved from a previous stop |
+| `restart_comfyui` `action:"stop"` | Stop the running ComfyUI process (saves PID and launch args for restart; on Windows, `action:"start"` cannot bring it back) |
+| `restart_comfyui` `action:"start"` | Start ComfyUI using info saved from a previous stop (macOS/Linux; refused on Windows) |
+| `restart_comfyui` `action:"status"` | Read-only: what start/stop/restart would do now, and whether a stop could be undone by this tool. Call it before `stop` |
 
 ### Generation Tracker
 
