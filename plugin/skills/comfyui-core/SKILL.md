@@ -230,7 +230,11 @@ When ComfyUI is unresponsive or crashed:
 4. After ComfyUI is back, re-enqueue any failed/lost workflows
 
 Before stopping ComfyUI for maintenance:
-1. Call `restart_comfyui` with `action: "status"` first. It is read-only. If `stop.recoverable_by_start` is not `"yes"`, a stop needs a person to start ComfyUI again (`stop.manual_recovery_reason` says why), so tell the user before you stop
+1. Call `restart_comfyui` with `action: "status"` first. It is read-only. Then read `stop.recoverable_by_start`:
+   - `"yes"`: `action: "start"` can bring it back
+   - `"no"`: after a stop, a person has to start ComfyUI again (`stop.manual_recovery_reason` says why), so tell the user before you stop
+   - `"unknown"`: whether it can be brought back is not established. Resolve that, or tell the user, before a maintenance stop. If `target_stable` is `false`, the target changed mid-check, so just call status again
+   - `"not-applicable"`: the stop itself is unavailable (`stop.allowed` is not `"yes"`), so there is nothing for `start` to recover. `stop.manual_recovery_reason` says why
 2. To cycle ComfyUI, use `action: "restart"`, not `stop` then `start`. Restart refuses rather than leaving ComfyUI down when it cannot bring it back
 3. Use `action: "stop"` only when ComfyUI should stay down
 
