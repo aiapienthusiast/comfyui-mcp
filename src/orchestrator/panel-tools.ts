@@ -404,6 +404,7 @@ import {
   isReplyTimeoutTagged,
   isRoutingAmbiguity,
   requiresWorkflowStampEnforcement,
+  type DeliveredMutationReceipt,
 } from "../services/ui-bridge.js";
 import {
   GRAPH_READ_CMD_BY_TOOL,
@@ -1441,6 +1442,15 @@ export const __panelToolsTestHooks = {
   setOutstandingMutationReadSettleMs(ms: number | null): void {
     outstandingMutationReadSettleMsOverride = ms;
   },
+  /** Shrink the #2955 panel_run wait for earlier unacknowledged graph edits. */
+  setRunFreshnessBarrierMs(ms: number | null): void {
+    runFreshnessBarrierMsOverride = ms;
+  },
+  /** #2955 — observe the moment panel_run starts waiting, and on what, so a test
+   *  can order its releases against the barrier instead of against a clock. */
+  setRunFreshnessWaitObserver(fn: ((snapshot: RunFreshnessSnapshot) => void) | null): void {
+    runFreshnessWaitObserver = fn;
+  },
   /** Mark a synthetic graph_run result as the bridge's authoritative reply timeout. */
   markRunReplyTimeout(res: ToolResult): ToolResult {
     Object.defineProperty(res, REPLY_TIMEOUT_RESULT, {
@@ -1556,6 +1566,18 @@ let outstandingMutationReadSettleMsOverride: number | null = null;
 function outstandingMutationReadSettleMs(): number {
   return outstandingMutationReadSettleMsOverride ?? OUTSTANDING_MUTATION_READ_SETTLE_MS;
 }
+
+// #2955 — how long panel_run waits for graph edits issued BEFORE it to be
+// acknowledged before it refuses (nothing dispatched). The same window graph_run
+// itself is given to answer: a run is willing to wait for the edits it must
+// include as long as it waits for its own reply, and no longer.
+const RUN_FRESHNESS_BARRIER_MS = 20_000;
+let runFreshnessBarrierMsOverride: number | null = null;
+function runFreshnessBarrierMs(): number {
+  return runFreshnessBarrierMsOverride ?? RUN_FRESHNESS_BARRIER_MS;
+}
+type RunFreshnessSnapshot = { intents: number; awaited: number; timedOut: number };
+let runFreshnessWaitObserver: ((snapshot: RunFreshnessSnapshot) => void) | null = null;
 
 const GRAPH_READ_SETTLE_CMDS: ReadonlySet<string> = new Set([
   ...Object.values(GRAPH_READ_CMD_BY_TOOL),
@@ -20818,6 +20840,188 @@ function withRetryToken(d: PanelToolDef): PanelToolDef {
 }
 
 /**
+ * #2955 — a mutating panel tool call that has started and not yet returned, on
+ * one tool session. Covers the whole handler, including the read-only preflight
+ * (graph_get_subgraph / graph_query / graph_outline) that runs BEFORE its write
+ * frame is sent — a window no bridge receipt can see.
+ */
+type MutationIntent = { tool: string; finished: boolean; done: Promise<void> };
+
+/** Keyed by the session's ctx: one agent's overlapping calls share it. */
+const mutationIntents = new WeakMap<PanelToolCtx, Set<MutationIntent>>();
+
+function withMutationIntent(d: PanelToolDef): PanelToolDef {
+  return {
+    ...d,
+    handler: async (args: Record<string, unknown>, ctx: PanelToolCtx): Promise<ToolResult> => {
+      let finish = (): void => {};
+      const intent: MutationIntent = {
+        tool: d.name,
+        finished: false,
+        done: new Promise<void>((resolve) => {
+          finish = resolve;
+        }),
+      };
+      let live = mutationIntents.get(ctx);
+      if (!live) {
+        live = new Set();
+        mutationIntents.set(ctx, live);
+      }
+      live.add(intent);
+      try {
+        return await d.handler(args, ctx);
+      } finally {
+        intent.finished = true;
+        live.delete(intent);
+        finish();
+      }
+    },
+  };
+}
+
+/** Timed-out (#2527) mutations still unsettled on `tabId`, minus earlier runs. */
+function outstandingGraphEdits(
+  bridge: PanelToolCtx["bridge"],
+  tabId: string,
+): DeliveredMutationReceipt[] {
+  if (typeof bridge?.listOutstandingMutations !== "function") return [];
+  return bridge.listOutstandingMutations(tabId).filter((m) => m.cmd !== "graph_run");
+}
+
+function describeDeliveredEdit(m: DeliveredMutationReceipt): string {
+  const node = m.frame.node_id !== undefined ? ` node ${String(m.frame.node_id)}` : "";
+  const widget = typeof m.frame.widget === "string" ? ` widget "${m.frame.widget}"` : "";
+  return `"${m.cmd}"${node}${widget}`;
+}
+
+async function settleWithin(work: Promise<unknown>, ms: number): Promise<void> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    await Promise.race([
+      work.then(
+        () => undefined,
+        () => undefined,
+      ),
+      new Promise<void>((resolve) => {
+        timer = setTimeout(resolve, Math.max(0, ms));
+      }),
+    ]);
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+}
+
+/**
+ * #2955 — panel_run must not serialize the graph while edits the caller issued
+ * BEFORE it are still unacknowledged.
+ *
+ * The bridge's graph lane releases a targeted mutation as soon as its frame is
+ * written (#2559), and the frontend's graph_set_widget awaits /object_info work
+ * before it applies the value. So a graph_run issued alongside a write — or while
+ * that write's handler is still in its preflight — reaches the serializer first
+ * and queues the PREVIOUS values; the write then acks `set` and the run reports
+ * queued. Nothing is wrong on either reply, which is why it surfaced only in
+ * history.
+ *
+ * The barrier snapshots what is outstanding when the run STARTS — this session's
+ * in-progress mutating calls and every frame the bridge has delivered to this tab
+ * that is still awaiting its reply — and waits for exactly those. Edits issued
+ * after the run started are not waited for: absorbing the next cell's writes would
+ * be the same bug pointed the other way. It runs before the handler, so the
+ * duplicate fence and everything after it read state from after the wait.
+ *
+ * Fails closed BEFORE dispatch. If a snapshotted edit is still unacknowledged when
+ * the budget ends, or the session's target moved while waiting, nothing is sent:
+ * no prompt can exist, so the honest remedy is a plain re-run without retry_of.
+ * It never rebinds and never re-dispatches. A write that timed out (#2527) is
+ * already an announced unknown; the run waits the same settle a graph read does,
+ * then queues and says the render may not include it.
+ */
+function withRunFreshnessBarrier(d: PanelToolDef): PanelToolDef {
+  return {
+    ...d,
+    handler: async (args: Record<string, unknown>, ctx: PanelToolCtx): Promise<ToolResult> => {
+      const tabAtStart = ctx.tabId;
+      const bridge = ctx.bridge;
+      const intents = [...(mutationIntents.get(ctx) ?? [])];
+      const awaited =
+        typeof bridge?.listAwaitedMutations === "function"
+          ? bridge.listAwaitedMutations(tabAtStart)
+          : [];
+      const timedOut = outstandingGraphEdits(bridge, tabAtStart);
+      if (intents.length || awaited.length || timedOut.length) {
+        const budgetMs = runFreshnessBarrierMs();
+        runFreshnessWaitObserver?.({
+          intents: intents.length,
+          awaited: awaited.length,
+          timedOut: timedOut.length,
+        });
+        await settleWithin(
+          Promise.all([
+            Promise.all(intents.map((intent) => intent.done)),
+            awaited.length && typeof bridge.waitForMutationReplies === "function"
+              ? bridge.waitForMutationReplies(
+                  awaited.map((m) => m.rid),
+                  budgetMs,
+                )
+              : undefined,
+            timedOut.length ? awaitOutstandingMutationSettle(bridge, tabAtStart) : undefined,
+          ]),
+          budgetMs,
+        );
+        if (ctx.tabId !== tabAtStart) {
+          return fail(
+            `panel_run was NOT dispatched — nothing was queued and the queue is untouched. This ` +
+              `session's canvas target changed from "${tabAtStart}" to "${ctx.tabId}" while the run ` +
+              `waited for earlier graph edits to be acknowledged, so those edits and this run no ` +
+              `longer address the same canvas. Nothing was rebound. Confirm which workflow you ` +
+              `mean (panel_graph_outline / panel_set_workflow_target), then call panel_run again — ` +
+              `do NOT pass retry_of: no run was dispatched, so there is nothing to dedupe.`,
+          );
+        }
+        const stillAwaited = new Set(
+          (typeof bridge.listAwaitedMutations === "function"
+            ? bridge.listAwaitedMutations(tabAtStart)
+            : []
+          ).map((m) => m.rid),
+        );
+        const unfinished = [
+          ...intents
+            .filter((intent) => !intent.finished)
+            .map((intent) => `${intent.tool} (call still in progress)`),
+          ...awaited
+            .filter((m) => stillAwaited.has(m.rid))
+            .map((m) => `${describeDeliveredEdit(m)} (delivered, awaiting the panel's reply)`),
+        ];
+        if (unfinished.length) {
+          return fail(
+            `panel_run was NOT dispatched — nothing was queued and the queue is untouched. ` +
+              `${unfinished.length} graph edit(s) issued on this canvas before this run were still ` +
+              `unacknowledged after ${(budgetMs / 1000).toFixed(1)}s: ${unfinished.join("; ")}. ` +
+              `Serializing the graph now would queue it WITHOUT them and render the previous ` +
+              `values (#2955). Wait for those calls to return and check that each reported ` +
+              `success (confirm the values with panel_query_graph if unsure), then call panel_run ` +
+              `again — do NOT pass retry_of: no run was dispatched, so there is nothing to dedupe.`,
+          );
+        }
+      }
+      const unsettled = outstandingGraphEdits(bridge, ctx.tabId);
+      const res = await d.handler(args, ctx);
+      if (res.isError || unsettled.length === 0) return res;
+      return appendToolResultText(
+        res,
+        `\n\n[FRESHNESS] OUTCOME UNKNOWN: ${unsettled.length} earlier graph edit(s) on this tab ` +
+          `had timed out without the panel acknowledging them when this run was dispatched ` +
+          `(${unsettled.map((m) => `${describeDeliveredEdit(m)} retry_of:"${m.rid}"`).join(", ")}). ` +
+          `The queued render may not include them. Check the output; if a value is missing, ` +
+          `confirm it with panel_query_graph (or retry that edit with its retry_of token), then ` +
+          `run again (#2955).`,
+      );
+    },
+  };
+}
+
+/**
  * The SINGLE source of truth for the panel_* tool surface. Both transports
  * register these exact definitions, so the Claude (in-process) and Codex (HTTP)
  * backends expose an identical panel toolset.
@@ -29722,7 +29926,14 @@ CHECKED FOR YOU: the graph read this message prescribes was just run, and it ` +
   ];
   // #694: every MUTATING panel tool (RETRY_TOKEN_CMD_BY_TOOL) accepts the explicit
   // retry token in its schema and forwards it, untouched, on its command frames.
-  return defs.map((d) => (d.name in RETRY_TOKEN_CMD_BY_TOOL ? withRetryToken(d) : d));
+  // #2955: those same tools register an in-progress intent, and panel_run waits
+  // for the ones that started before it. Both are OUTERMOST so they see the
+  // session ctx itself, not withRetryToken's per-call delegate.
+  return defs.map((d) => {
+    if (!(d.name in RETRY_TOKEN_CMD_BY_TOOL)) return d;
+    const tokened = withRetryToken(d);
+    return d.name === "panel_run" ? withRunFreshnessBarrier(tokened) : withMutationIntent(tokened);
+  });
 }
 
 /**

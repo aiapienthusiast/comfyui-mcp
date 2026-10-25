@@ -207,6 +207,24 @@ type Pending = {
   ctx: SendCtx;
 };
 
+/**
+ * #2955 — the in-flight reply map, reporting every removal. A command leaves it
+ * on its reply, reply timeout, mid-command drop, workflow replacement, send
+ * failure or bridge stop; each of those exits deletes from this one map, so a
+ * waiter asking "is this mutation's reply still awaited?" cannot miss one.
+ */
+class PendingReplies extends Map<string, Pending> {
+  constructor(private readonly onRemoved: () => void) {
+    super();
+  }
+
+  override delete(rid: string): boolean {
+    const removed = super.delete(rid);
+    if (removed) this.onRemoved();
+    return removed;
+  }
+}
+
 interface Conn {
   sock: BridgeSocket;
   tabId: string;
@@ -2404,7 +2422,9 @@ export class UiBridge {
    *  push()-path frames (agent turn output). Bounded per tab. */
   private missedFrames = new Map<string, Record<string, unknown>[]>();
   private static readonly MAX_MISSED_FRAMES = 100;
-  private pending = new Map<string, Pending>();
+  private pending = new PendingReplies(() => this.notifyMutationReplyWaiters());
+  /** #2955 — re-checked whenever an in-flight reply leaves `pending`. */
+  private mutationReplyWaiters = new Set<() => void>();
   /**
    * #2069 / #2559 — per-tab chain of `graph_*` dispatches. The panel's WS
    * listener is async-per-message, so concurrent READ frames share the main
@@ -4921,6 +4941,59 @@ export class UiBridge {
       this.mutationSettleWaiters.push(waiter);
       if (this.listOutstandingMutations(tabId).length === 0) finish();
     });
+  }
+
+  /**
+   * #2955 — mutations delivered to `tabId` (or to the socket it is routed to)
+   * whose reply is still awaited: the frame is on the panel and the frontend has
+   * not acknowledged it. A graph_run serialized now would not include them.
+   *
+   * Keyed on `pending`, not on the receipt's status alone: a command whose
+   * waiter has already been dropped (timeout, mid-command drop, workflow
+   * replacement) is no longer awaited here — a timed-out one is reported by
+   * listOutstandingMutations instead. graph_run frames are excluded: one run's
+   * acknowledgement does not change what another run serializes.
+   */
+  listAwaitedMutations(tabId: string): DeliveredMutationReceipt[] {
+    const routedSock = this.conns.get(tabId)?.sock;
+    const out: DeliveredMutationReceipt[] = [];
+    for (const [rid, p] of this.pending) {
+      const e = this.deliveredMutations.get(rid);
+      if (!e || e.status !== "in_flight" || e.cmd === "graph_run") continue;
+      const sameTab = e.tabId === tabId || p.ctx.tabId === tabId;
+      const sameSocket = routedSock !== undefined && p.sock === routedSock;
+      if (!sameTab && !sameSocket) continue;
+      out.push({ rid, cmd: e.cmd, tabId: e.tabId, ts: e.ts, frame: e.frame, status: e.status });
+    }
+    return out;
+  }
+
+  /**
+   * #2955 — resolve once none of `rids` is still awaiting its reply, or when
+   * `budgetMs` elapses. Resolves without throwing; the caller re-reads
+   * listAwaitedMutations to learn which, if any, are still unacknowledged.
+   */
+  waitForMutationReplies(rids: readonly string[], budgetMs: number): Promise<void> {
+    const awaited = () => rids.some((rid) => this.pending.has(rid));
+    if (!awaited()) return Promise.resolve();
+    const budget = Number.isFinite(budgetMs) ? Math.max(0, Math.floor(budgetMs)) : 0;
+    if (budget <= 0) return Promise.resolve();
+    return new Promise((resolve) => {
+      const finish = () => {
+        clearTimeout(timer);
+        this.mutationReplyWaiters.delete(check);
+        resolve();
+      };
+      const check = () => {
+        if (!awaited()) finish();
+      };
+      const timer = setTimeout(finish, budget);
+      this.mutationReplyWaiters.add(check);
+    });
+  }
+
+  private notifyMutationReplyWaiters(): void {
+    for (const check of [...this.mutationReplyWaiters]) check();
   }
 
   private outstandingTimedOutCount(tabId: string): number {
