@@ -522,7 +522,9 @@ describe('restart_comfyui (action:"status") on Windows is read-only and truthful
     expect(status.windows_direct_launch_blocked).toBe(true);
     expect(status.instance).toMatchObject({ identified: "yes", pid: 4321, desktop: false });
     expect(status.start.launches).toBe("no");
-    expect(status.start.reason).toMatch(REFUSAL);
+    // startComfyUI's own order: the port is held, so it reports "already running"
+    // before it would reach the Windows refusal.
+    expect(status.start.reason).toMatch(/held by PID 4321/);
     expect(status.stop.allowed).toBe("yes");
     expect(status.stop.recoverable_by_start).toBe("no");
     expect(status.stop.manual_recovery_reason).toMatch(REFUSAL);
@@ -618,6 +620,30 @@ describe('restart_comfyui (action:"status") on Windows is read-only and truthful
     // The configured command does not make an explicit stop recoverable by start.
     expect(status.stop.recoverable_by_start).toBe("no");
     expectNoEffects(fetchSpy);
+  });
+
+  it("a free port + a current saved record: status and start both give the Windows refusal", async () => {
+    hoisted.getSystemStats.mockRejectedValue(new Error("fetch failed"));
+    hoisted.execSync.mockImplementation(() => "");
+    __processControlTestHooks.setLastProcessInfo({
+      pid: 4321,
+      port: 8188,
+      argv: SERVER_ARGV,
+      isDesktopApp: false,
+    });
+    const saved = __processControlTestHooks.getLastProcessInfo();
+
+    const status = await describeLifecycleStatus();
+
+    expect(status.start.launches).toBe("no");
+    expect(status.start.reason).toMatch(REFUSAL);
+    expectNoEffects();
+    expect(__processControlTestHooks.getLastProcessInfo()).toBe(saved);
+
+    const started = await startComfyUI();
+    expect(started.startup).toBe("not-attempted");
+    expect(started.message).toMatch(REFUSAL);
+    expect(hoisted.spawn).not.toHaveBeenCalled();
   });
 
   it("nothing running: stop and restart refuse, and nothing is identified", async () => {

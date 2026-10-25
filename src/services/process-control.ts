@@ -7061,6 +7061,11 @@ interface LifecycleStatus {
   read_only: true;
   platform: NodeJS.Platform;
   target: { base_url: string; port: number; remote: boolean };
+  /**
+   * False when the configured target moved while this answer was being collected.
+   * Every other answer is then `unknown` — readings of two targets are never mixed.
+   */
+  target_stable: boolean;
   /** True on Windows, where restart_comfyui refuses every direct launch (#2947). */
   windows_direct_launch_blocked: boolean;
   instance: { identified: LifecycleAnswer; pid?: number; desktop?: boolean; detail?: string };
@@ -7107,6 +7112,9 @@ interface LifecycleStatus {
  * identity and target when they run, so they may still refuse.
  */
 export async function describeLifecycleStatus(): Promise<LifecycleStatus> {
+  // Captured BEFORE the first await: every reading below must belong to this
+  // target, and an A→B→A round trip is caught by the generation, not the base.
+  const fence = currentTargetFence();
   const remote = isRemoteMode();
   const port = config.resolvedPort;
   const limits = [
@@ -7122,7 +7130,8 @@ export async function describeLifecycleStatus(): Promise<LifecycleStatus> {
   const base: Omit<LifecycleStatus, "instance" | "start" | "stop" | "restart" | "summary"> = {
     read_only: true,
     platform: platform(),
-    target: { base_url: getComfyUIBaseUrl().replace(/\/+$/, ""), port, remote },
+    target: { base_url: fence.baseUrl, port, remote },
+    target_stable: true,
     windows_direct_launch_blocked: IS_WIN,
     auto_restart: supervisorResult(),
     limits,
@@ -7172,32 +7181,15 @@ export async function describeLifecycleStatus(): Promise<LifecycleStatus> {
         }
       : undefined;
 
-  // ---- start: what a call made NOW would do --------------------------------
-  let start: LifecycleStatus["start"];
-  if (IS_WIN) {
-    start = { launches: "no", reason: WINDOWS_DIRECT_LAUNCH_REFUSAL };
-  } else if (info && !info.pidFromDesktopScan) {
-    start = {
-      launches: "no",
-      reason: `A ComfyUI already answers on port ${info.port} (PID ${info.pid}); start would report it and launch nothing.`,
-    };
-  } else if (lastProcessInfo) {
-    // A copy: assessRelaunch records the resolved launcher on the object it is given.
-    const saved = assessRelaunch({ ...lastProcessInfo });
-    start = saved.ok
-      ? {
-          launches: "yes",
-          reason: "The launch record saved by the last stop validates on disk; start would relaunch it.",
-        }
-      : { launches: "no", reason: saved.reason ?? "The saved launch record does not validate." };
-  } else {
-    start = {
-      launches: "unknown",
-      reason:
-        "No launch record is saved; start would look for a ComfyUI Desktop app in its common " +
-        "install locations, which this status call does not probe.",
-    };
+  // Nothing below awaits, so this one check covers every reading above (#2948).
+  if (
+    !targetFenceMatchesCurrent(fence) ||
+    (info && (!info.targetFence || !targetFencesEqual(info.targetFence, fence)))
+  ) {
+    return targetMovedStatus(base, fence);
   }
+
+  const start = predictDirectStart();
 
   if (!info) {
     const why =
@@ -7343,6 +7335,92 @@ export async function describeLifecycleStatus(): Promise<LifecycleStatus> {
   };
 }
 
+/**
+ * What a DIRECT action:"start" would decide now — startComfyUI's prerequisites in
+ * its own order, read-only. It does NOT clear a stale record the way start does;
+ * it only says start would.
+ */
+function predictDirectStart(): LifecycleStatus["start"] {
+  const saved = lastProcessInfo;
+  if (saved && !saved.targetFence) {
+    return {
+      launches: "no",
+      reason:
+        "start would refuse: the saved launch record has no target identity, so it cannot be " +
+        "proven to belong to this ComfyUI (start would also discard it).",
+    };
+  }
+  if (saved?.targetFence && !targetFenceMatchesCurrent(saved.targetFence)) {
+    return {
+      launches: "no",
+      reason:
+        `start would refuse: the saved launch record belongs to an older ComfyUI target ` +
+        `(${saved.targetFence.baseUrl}), and start would discard it.`,
+    };
+  }
+  const port = config.resolvedPort;
+  const probe = probePortOwner(port);
+  if (probe.state === "owned") {
+    return {
+      launches: "no",
+      reason: `Port ${port} is held by PID ${probe.pid}; start would report ComfyUI already running and launch nothing.`,
+    };
+  }
+  if (IS_WIN) return { launches: "no", reason: WINDOWS_DIRECT_LAUNCH_REFUSAL };
+  if (probe.state === "unknown") {
+    return {
+      launches: "unknown",
+      reason:
+        `Whether port ${port} is free could not be determined (${probe.reason}); start would still ` +
+        "try to launch, and could not claim that whatever answers is its own.",
+    };
+  }
+  if (!saved) {
+    return {
+      launches: "unknown",
+      reason:
+        "No launch record is saved; start would look for a ComfyUI Desktop app in its common " +
+        "install locations, which this status call does not probe.",
+    };
+  }
+  // A copy: assessRelaunch records the resolved launcher on the object it is given.
+  const copy = { ...saved };
+  const assessed = assessRelaunch(copy);
+  if (assessed.ok) {
+    return {
+      launches: "yes",
+      reason: "Port is free and the launch record saved by the last stop validates on disk; start would relaunch it.",
+    };
+  }
+  if (!copy.isDesktopApp && !resolveLaunchCommand(copy)) {
+    return { launches: "no", reason: "start would refuse: no command can be built from the saved launch record." };
+  }
+  return {
+    launches: "unknown",
+    reason: `start would try the saved launch command, but ${assessed.reason ?? "it does not validate on disk"}`,
+  };
+}
+
+/** The conservative answer when the target moved mid-collection: retry, never mix. */
+function targetMovedStatus(
+  base: Omit<LifecycleStatus, "instance" | "start" | "stop" | "restart" | "summary">,
+  fence: ComfyUITargetFence,
+): LifecycleStatus {
+  const why =
+    `The ComfyUI target changed while this status was being collected (it began for ` +
+    `${fence.baseUrl}), so the readings may describe two different instances and none of ` +
+    `them is reported. Nothing was changed. Retry once the target has settled.`;
+  return {
+    ...base,
+    target_stable: false,
+    instance: { identified: "unknown", detail: why },
+    start: { launches: "unknown", reason: why },
+    stop: { allowed: "unknown", recoverable_by_start: "unknown", manual_recovery_reason: why },
+    restart: { route: "none", will_attempt: "unknown", evidence: "none", reason: why },
+    summary: why,
+  };
+}
+
 function configuredCommandRoute(limits: string[]): LifecycleStatus["restart"] {
   limits.push(
     "COMFYUI_RESTART_COMMAND is run as configured. Whether it restarts ComfyUI, and whether " +
@@ -7427,6 +7505,11 @@ export const __processControlTestHooks = {
   /** Read the saved launch record, so a read-only path can be shown not to change it. */
   getLastProcessInfo(): ProcessInfo | null {
     return lastProcessInfo;
+  },
+  /** Store a launch record VERBATIM — including one with no target fence, which
+   *  setLastProcessInfo would stamp — to drive start's fence refusals. */
+  setRawLastProcessInfo(info: ProcessInfo | null): void {
+    lastProcessInfo = info;
   },
   setLastProcessInfo(info: ProcessInfo): void {
     lastProcessInfo = {
