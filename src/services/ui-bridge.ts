@@ -2062,6 +2062,12 @@ export type DeliveredMutationReceipt = {
   status: "in_flight" | "timed_out";
 };
 
+/** #2955 — how far a delivered mutation's outcome is known (see mutationSettlement). */
+export type MutationSettlement = "settled" | "awaiting" | "unknown";
+
+/** #2955 — a delivered mutation whose outcome is not yet definite. */
+export type UnsettledMutation = DeliveredMutationReceipt & { settlement: "awaiting" | "unknown" };
+
 /** Peek of a delivered mutation, including one that already settled late. */
 export type PeekedDeliveredMutation = {
   rid: string;
@@ -2548,6 +2554,12 @@ export class UiBridge {
   >();
   /** Waiters blocked on a tab's outcome-unknown mutations settling (#2527). */
   private mutationSettleWaiters: Array<{ tabId: string; finish: () => void }> = [];
+  /** #2955 — delivered mutations with a DEFINITE outcome: answered (ok or a
+   *  refusal), never written, acknowledged late, or reconciled by an exact
+   *  retry_of. Leaving `pending` is not settlement — a reply timeout, a
+   *  mid-command drop and a workflow replacement all leave it with the outcome
+   *  unknown — so a run barrier reads settlement only from here. */
+  private settledMutations = new Map<string, { tabId: string; ts: number }>();
   /** Exact prompt receipts sent by the Panel after its graph_run command returned. */
   private lateRunReceipts = new Map<
     string,
@@ -4821,6 +4833,9 @@ export class UiBridge {
     const started = this.deliveredMutations.get(rid);
     if (!started) return;
     this.deliveredMutations.delete(rid);
+    // #2955 — a late refusal is as definite as a late success for a run barrier:
+    // the frontend has finished with this command either way.
+    this.recordMutationSettled(rid, started.tabId);
     if (msg.ok !== true) {
       this.notifyMutationSettled(started.tabId);
       return;
@@ -4944,38 +4959,83 @@ export class UiBridge {
   }
 
   /**
-   * #2955 — mutations delivered to `tabId` (or to the socket it is routed to)
-   * whose reply is still awaited: the frame is on the panel and the frontend has
-   * not acknowledged it. A graph_run serialized now would not include them.
-   *
-   * Keyed on `pending`, not on the receipt's status alone: a command whose
-   * waiter has already been dropped (timeout, mid-command drop, workflow
-   * replacement) is no longer awaited here — a timed-out one is reported by
-   * listOutstandingMutations instead. graph_run frames are excluded: one run's
-   * acknowledgement does not change what another run serializes.
+   * #2955 — every delivered mutation on `tabId` (or on the socket it is routed
+   * to) whose outcome is not yet DEFINITE, oldest first:
+   *  - `awaiting` — the frame is on the panel and its reply is still awaited;
+   *  - `unknown`  — nothing is awaiting it any more but no outcome arrived: a
+   *    reply timeout, a mid-command drop, or a same-tab workflow replacement
+   *    that cancelled the waiter (dropQueuedDeliveries). The command may still
+   *    have applied, or may yet.
+   * graph_run frames are excluded: one run's acknowledgement does not change
+   * what another run serializes. A run barrier must read THIS, not "left
+   * `pending`", because every one of those exits also leaves `pending`.
    */
-  listAwaitedMutations(tabId: string): DeliveredMutationReceipt[] {
-    const routedSock = this.conns.get(tabId)?.sock;
-    const out: DeliveredMutationReceipt[] = [];
-    for (const [rid, p] of this.pending) {
-      const e = this.deliveredMutations.get(rid);
-      if (!e || e.status !== "in_flight" || e.cmd === "graph_run") continue;
-      const sameTab = e.tabId === tabId || p.ctx.tabId === tabId;
-      const sameSocket = routedSock !== undefined && p.sock === routedSock;
+  listUnsettledMutations(tabId: string): UnsettledMutation[] {
+    this.pruneLateMutations();
+    // Route the address the way send() does (exact id, prefix, same-socket
+    // migration alias, or a session scope address such as orchestrator::<backend>,
+    // #884): receipts are recorded under the CANONICAL live tab id, so an exact
+    // comparison against a scope address would see none of them.
+    let canonical = tabId;
+    let routedSock: BridgeSocket | undefined;
+    try {
+      const conn = this.resolveTarget(tabId);
+      canonical = conn.tabId;
+      routedSock = conn.sock;
+    } catch {
+      routedSock = this.conns.get(tabId)?.sock;
+    }
+    const out: UnsettledMutation[] = [];
+    for (const [rid, e] of this.deliveredMutations) {
+      if (e.cmd === "graph_run") continue;
+      const p = this.pending.get(rid);
+      const sameTab =
+        e.tabId === tabId ||
+        e.tabId === canonical ||
+        p?.ctx.tabId === tabId ||
+        p?.ctx.tabId === canonical;
+      const sameSocket = routedSock !== undefined && p !== undefined && p.sock === routedSock;
       if (!sameTab && !sameSocket) continue;
-      out.push({ rid, cmd: e.cmd, tabId: e.tabId, ts: e.ts, frame: e.frame, status: e.status });
+      out.push({
+        rid,
+        cmd: e.cmd,
+        tabId: e.tabId,
+        ts: e.ts,
+        frame: e.frame,
+        status: e.status,
+        settlement: p !== undefined && e.status === "in_flight" ? "awaiting" : "unknown",
+      });
     }
     return out;
   }
 
+  /** #2955 — the awaited subset of {@link listUnsettledMutations}. */
+  listAwaitedMutations(tabId: string): DeliveredMutationReceipt[] {
+    return this.listUnsettledMutations(tabId)
+      .filter((m) => m.settlement === "awaiting")
+      .map(({ settlement: _settlement, ...receipt }) => receipt);
+  }
+
   /**
-   * #2955 — resolve once none of `rids` is still awaiting its reply, or when
-   * `budgetMs` elapses. Resolves without throwing; the caller re-reads
-   * listAwaitedMutations to learn which, if any, are still unacknowledged.
+   * #2955 — the outcome of one delivered mutation as a run barrier may rely on
+   * it. Only a recorded definite outcome is `settled`; an rid the bridge no
+   * longer holds at all (pruned, never seen) is `unknown`, never `settled`.
    */
-  waitForMutationReplies(rids: readonly string[], budgetMs: number): Promise<void> {
-    const awaited = () => rids.some((rid) => this.pending.has(rid));
-    if (!awaited()) return Promise.resolve();
+  mutationSettlement(rid: string): MutationSettlement {
+    if (this.settledMutations.has(rid) || this.lateMutations.has(rid)) return "settled";
+    const e = this.deliveredMutations.get(rid);
+    if (e && e.status === "in_flight" && this.pending.has(rid)) return "awaiting";
+    return "unknown";
+  }
+
+  /**
+   * #2955 — resolve once every one of `rids` is settled, or when `budgetMs`
+   * elapses. Event-driven (reply, late reply, reconcile); resolves without
+   * throwing, and the caller re-reads mutationSettlement for the verdict.
+   */
+  waitForMutationSettlement(rids: readonly string[], budgetMs: number): Promise<void> {
+    const open = () => rids.some((rid) => this.mutationSettlement(rid) !== "settled");
+    if (!open()) return Promise.resolve();
     const budget = Number.isFinite(budgetMs) ? Math.max(0, Math.floor(budgetMs)) : 0;
     if (budget <= 0) return Promise.resolve();
     return new Promise((resolve) => {
@@ -4985,11 +5045,33 @@ export class UiBridge {
         resolve();
       };
       const check = () => {
-        if (!awaited()) finish();
+        if (!open()) finish();
       };
       const timer = setTimeout(finish, budget);
       this.mutationReplyWaiters.add(check);
     });
+  }
+
+  /**
+   * #2955 — an exact retry_of of this outcome-unknown mutation was answered
+   * successfully: the panel either deduped it onto the original's outcome or
+   * applied it now, and the original rid cannot apply again behind it. Record
+   * that as the definite outcome so a run barrier can proceed. Only an
+   * unsettled delivered receipt that is not awaiting its own reply qualifies.
+   */
+  markMutationReconciled(rid: string): boolean {
+    const e = this.deliveredMutations.get(rid);
+    if (!e || this.mutationSettlement(rid) !== "unknown") return false;
+    this.deliveredMutations.delete(rid);
+    this.recordMutationSettled(rid, e.tabId);
+    this.notifyMutationSettled(e.tabId);
+    return true;
+  }
+
+  private recordMutationSettled(rid: string, tabId: string): void {
+    this.settledMutations.set(rid, { tabId, ts: Date.now() });
+    this.pruneLateMutations();
+    this.notifyMutationReplyWaiters();
   }
 
   private notifyMutationReplyWaiters(): void {
@@ -5158,11 +5240,20 @@ export class UiBridge {
     for (const [rid, e] of this.lateRunReceiptHandoffs) {
       if (e.expiresAt <= now) this.lateRunReceiptHandoffs.delete(rid);
     }
+    for (const [rid, e] of this.settledMutations) {
+      if (now - e.ts > UiBridge.LATE_MUTATION_TTL_MS) this.settledMutations.delete(rid);
+    }
     // Map iteration is insertion-ordered, so dropping from the front drops the
     // oldest. Quiet, unlike the ask-mapping overflow: losing one of 256 late
     // completions costs the caller a notice they can still get by looking, where
     // losing an ask mapping loses a user's answer outright.
-    for (const map of [this.deliveredMutations, this.lateMutations, this.lateRunReceipts, this.lateRunReceiptHandoffs]) {
+    for (const map of [
+      this.deliveredMutations,
+      this.lateMutations,
+      this.lateRunReceipts,
+      this.lateRunReceiptHandoffs,
+      this.settledMutations,
+    ]) {
       while (map.size > UiBridge.MAX_LATE_MUTATIONS) {
         const oldest = map.keys().next();
         if (oldest.done) break;
@@ -7002,6 +7093,9 @@ export class UiBridge {
     const hit = this.deliveredMutations.get(rid);
     if (!hit) return;
     this.deliveredMutations.delete(rid);
+    // #2955 — both callers are definite outcomes: the panel answered this rid
+    // (settlePendingReply), or the frame was never written (send failure).
+    this.recordMutationSettled(rid, hit.tabId);
     if (hit.status === "timed_out") this.notifyMutationSettled(hit.tabId);
   }
 

@@ -405,6 +405,7 @@ import {
   isRoutingAmbiguity,
   requiresWorkflowStampEnforcement,
   type DeliveredMutationReceipt,
+  type UnsettledMutation,
 } from "../services/ui-bridge.js";
 import {
   GRAPH_READ_CMD_BY_TOOL,
@@ -1576,7 +1577,7 @@ let runFreshnessBarrierMsOverride: number | null = null;
 function runFreshnessBarrierMs(): number {
   return runFreshnessBarrierMsOverride ?? RUN_FRESHNESS_BARRIER_MS;
 }
-type RunFreshnessSnapshot = { intents: number; awaited: number; timedOut: number };
+type RunFreshnessSnapshot = { intents: number; awaited: number; unknown: number };
 let runFreshnessWaitObserver: ((snapshot: RunFreshnessSnapshot) => void) | null = null;
 
 const GRAPH_READ_SETTLE_CMDS: ReadonlySet<string> = new Set([
@@ -20771,7 +20772,14 @@ function withRetryToken(d: PanelToolDef): PanelToolDef {
           if (mutationIdentityMatches(cmd, original.frame)) {
             const replay: Record<string, unknown> = { ...original.frame, retry_of: retryOf };
             delete replay.rid;
-            return ctx.call(replay, timeoutMs, onDispatchedRid, beforeDispatch);
+            return ctx.call(replay, timeoutMs, onDispatchedRid, beforeDispatch).then((res) => {
+              // #2955 — the panel answered the original's own token for the same
+              // command: it deduped onto the original's outcome or applied it now,
+              // and the original rid cannot land again behind it. That settles the
+              // outcome-unknown receipt a run barrier is holding on.
+              if (!res.isError) ctx.bridge?.markMutationReconciled?.(retryOf);
+              return res;
+            });
           }
         }
         return ctx.call(
@@ -20843,9 +20851,11 @@ function withRetryToken(d: PanelToolDef): PanelToolDef {
  * #2955 — a mutating panel tool call that has started and not yet returned, on
  * one tool session. Covers the whole handler, including the read-only preflight
  * (graph_get_subgraph / graph_query / graph_outline) that runs BEFORE its write
- * frame is sent — a window no bridge receipt can see.
+ * frame is sent — a window no bridge receipt can see. `failed` records how the
+ * call ENDED (an error result or a throw), because a run that depended on an
+ * edit must not treat "the call returned" as "the edit applied".
  */
-type MutationIntent = { tool: string; finished: boolean; done: Promise<void> };
+type MutationIntent = { tool: string; finished: boolean; failed: boolean; done: Promise<void> };
 
 /** Keyed by the session's ctx: one agent's overlapping calls share it. */
 const mutationIntents = new WeakMap<PanelToolCtx, Set<MutationIntent>>();
@@ -20858,6 +20868,7 @@ function withMutationIntent(d: PanelToolDef): PanelToolDef {
       const intent: MutationIntent = {
         tool: d.name,
         finished: false,
+        failed: true,
         done: new Promise<void>((resolve) => {
           finish = resolve;
         }),
@@ -20869,7 +20880,9 @@ function withMutationIntent(d: PanelToolDef): PanelToolDef {
       }
       live.add(intent);
       try {
-        return await d.handler(args, ctx);
+        const res = await d.handler(args, ctx);
+        intent.failed = res.isError === true;
+        return res;
       } finally {
         intent.finished = true;
         live.delete(intent);
@@ -20877,15 +20890,6 @@ function withMutationIntent(d: PanelToolDef): PanelToolDef {
       }
     },
   };
-}
-
-/** Timed-out (#2527) mutations still unsettled on `tabId`, minus earlier runs. */
-function outstandingGraphEdits(
-  bridge: PanelToolCtx["bridge"],
-  tabId: string,
-): DeliveredMutationReceipt[] {
-  if (typeof bridge?.listOutstandingMutations !== "function") return [];
-  return bridge.listOutstandingMutations(tabId).filter((m) => m.cmd !== "graph_run");
 }
 
 function describeDeliveredEdit(m: DeliveredMutationReceipt): string {
@@ -20912,111 +20916,316 @@ async function settleWithin(work: Promise<unknown>, ms: number): Promise<void> {
 }
 
 /**
+ * #2955 — the canvas a run would serialize, as the existing write fences
+ * identify it: the session's tab and workflow pin, the receiving connection's
+ * hello generation + incarnation (panelWriteConnectionIdentity, as promoted
+ * writes bind it), the bridge's workflow stamp for the tab (workflowUuidFor, the
+ * uuid graph_run is stamped with), and the panel's last structured graph-scope
+ * witness (promotedScopeFor).
+ */
+type RunTargetWitness = {
+  tabId: string;
+  pin: string;
+  connection: { generation: number; tabSessionId: string } | undefined;
+  workflow: TabWorkflowUuidRead;
+  scope: TabPromotedScopeRead;
+};
+
+function captureRunTargetWitness(ctx: PanelToolCtx): RunTargetWitness {
+  let connection: { generation: number; tabSessionId: string } | undefined;
+  try {
+    connection = panelWriteConnectionIdentity(ctx);
+  } catch {
+    connection = undefined;
+  }
+  const bridge = ctx.bridge;
+  let workflow: TabWorkflowUuidRead = {
+    known: false,
+    reason: "this bridge exposes no workflow identity",
+  };
+  if (typeof bridge?.workflowUuidFor === "function") {
+    workflow = bridge.workflowUuidFor(ctx.tabId);
+  }
+  let scope: TabPromotedScopeRead = {
+    known: false,
+    reason: "this bridge exposes no graph-scope witness",
+  };
+  if (typeof bridge?.promotedScopeFor === "function") {
+    try {
+      scope = bridge.promotedScopeFor(ctx.tabId);
+    } catch {
+      scope = { known: false, reason: "the graph-scope witness became unreadable" };
+    }
+  }
+  return {
+    tabId: ctx.tabId,
+    pin: JSON.stringify(ctx.workflowTarget?.get(ctx.tabId) ?? null),
+    connection,
+    workflow,
+    scope,
+  };
+}
+
+/** Why `w` cannot certify a canvas at all, or null. */
+function unverifiableRunTarget(w: RunTargetWitness): string | null {
+  if (!isUsablePanelConnectionIdentity(w.connection)) {
+    return "the receiving panel connection's identity could not be read";
+  }
+  if (w.workflow.known !== true) {
+    return `the tab's workflow identity could not be read (${w.workflow.reason})`;
+  }
+  return null;
+}
+
+/** Why the canvas after the wait is not proven to be the one before it, or null. */
+function runTargetDrift(before: RunTargetWitness, after: RunTargetWitness): string | null {
+  if (after.tabId !== before.tabId) {
+    return `the session's canvas target changed from "${before.tabId}" to "${after.tabId}"`;
+  }
+  if (after.pin !== before.pin) return "the session's workflow pin changed";
+  const unverifiable = unverifiableRunTarget(after);
+  if (unverifiable) return `${unverifiable} after the wait`;
+  if (
+    !isUsablePanelConnectionIdentity(before.connection) ||
+    !isUsablePanelConnectionIdentity(after.connection) ||
+    !samePanelConnectionIdentity(before.connection, after.connection)
+  ) {
+    return "the panel connection was replaced or re-registered (a reconnect or re-hello)";
+  }
+  if (before.workflow.known !== true || after.workflow.known !== true) {
+    return "the tab's workflow identity became unverifiable";
+  }
+  if (before.workflow.uuid !== after.workflow.uuid) return "the workflow on that tab changed";
+  if (before.scope.known) {
+    if (!after.scope.known) return "the canvas graph identity became unverifiable";
+    if (
+      before.scope.scope !== after.scope.scope ||
+      before.scope.ownerNodeId !== after.scope.ownerNodeId ||
+      before.scope.workflowUuid !== after.scope.workflowUuid ||
+      before.scope.graphIdentity !== after.scope.graphIdentity
+    ) {
+      return "the canvas graph identity changed";
+    }
+  }
+  return null;
+}
+
+/**
+ * An unsettled edit stamped for a DIFFERENT workflow than the one the run
+ * would be stamped with cannot apply to this graph — the panel's write-time
+ * stamp fence refuses it. Anything unstamped or unverifiable stays relevant.
+ */
+function editRelevantToRun(m: UnsettledMutation, w: RunTargetWitness): boolean {
+  const stamped = typeof m.frame.workflow_uuid === "string" ? m.frame.workflow_uuid : undefined;
+  if (stamped === undefined || w.workflow.known !== true || w.workflow.uuid === undefined) return true;
+  return stamped === w.workflow.uuid;
+}
+
+/**
+ * A retry_of whose ORIGINAL run already has a definite local receipt — the
+ * panel's late graph_run reply, or its exact late prompt receipt — is answered
+ * by reconciliation, not by a new serialization, so no barrier applies to it.
+ */
+function originalRunSettledLocally(bridge: PanelToolCtx["bridge"], retryOf: string): boolean {
+  const late = typeof bridge?.peekLateMutation === "function" ? bridge.peekLateMutation(retryOf) : undefined;
+  if (late && late.cmd === "graph_run" && "result" in late) return true;
+  const receipt =
+    typeof bridge?.peekLateRunReceipt === "function" ? bridge.peekLateRunReceipt(retryOf) : undefined;
+  return !!receipt && receipt.promptIds.length > 0;
+}
+
+function runFreshnessRefusal(retryOf: string | undefined, reasons: string[]): ToolResult {
+  const why = reasons.join(" ");
+  if (retryOf) {
+    return fail(
+      `panel_run (retry_of:"${retryOf}") was NOT dispatched — this retry attempt sent nothing to ` +
+        `the panel. The ORIGINAL run you are retrying is still outcome-UNKNOWN: it may already be ` +
+        `queued or rendering, and this refusal says nothing about it. ${why} Do NOT re-run ` +
+        `panel_run without retry_of — that could queue a duplicate of the original. Check queue ` +
+        `(action:"list") or get_history for it, and once the above is resolved call panel_run ` +
+        `again with the SAME retry_of:"${retryOf}" so the panel reconciles it against the ` +
+        `original instead of queueing it twice.`,
+    );
+  }
+  return fail(
+    `panel_run was NOT dispatched — this attempt sent nothing to the panel, nothing was queued, ` +
+      `and the queue is untouched. ${why} Call panel_run again once that is resolved; this ` +
+      `attempt minted no retry_of token, so there is nothing of its own to dedupe (if you are ` +
+      `reconciling an EARLIER outcome-unknown panel_run, keep passing that run's own retry_of).`,
+  );
+}
+
+/**
  * #2955 — panel_run must not serialize the graph while edits the caller issued
- * BEFORE it are still unacknowledged.
+ * BEFORE it are unacknowledged or of unknown outcome.
  *
  * The bridge's graph lane releases a targeted mutation as soon as its frame is
  * written (#2559), and the frontend's graph_set_widget awaits /object_info work
  * before it applies the value. So a graph_run issued alongside a write — or while
  * that write's handler is still in its preflight — reaches the serializer first
  * and queues the PREVIOUS values; the write then acks `set` and the run reports
- * queued. Nothing is wrong on either reply, which is why it surfaced only in
- * history.
+ * queued.
  *
  * The barrier snapshots what is outstanding when the run STARTS — this session's
- * in-progress mutating calls and every frame the bridge has delivered to this tab
- * that is still awaiting its reply — and waits for exactly those. Edits issued
- * after the run started are not waited for: absorbing the next cell's writes would
- * be the same bug pointed the other way. It runs before the handler, so the
- * duplicate fence and everything after it read state from after the wait.
+ * in-progress mutating calls, and every edit delivered to this tab whose outcome
+ * is not definite (awaiting its reply, or unknown after a timeout / drop /
+ * same-tab replacement) — and waits for exactly those to SETTLE: answered,
+ * acknowledged late, or reconciled by an exact retry_of. Edits issued after the
+ * run started are not waited for. It runs before the handler, so the duplicate
+ * fence and everything after it read post-wait state.
  *
- * Fails closed BEFORE dispatch. If a snapshotted edit is still unacknowledged when
- * the budget ends, or the session's target moved while waiting, nothing is sent:
- * no prompt can exist, so the honest remedy is a plain re-run without retry_of.
- * It never rebinds and never re-dispatches. A write that timed out (#2527) is
- * already an announced unknown; the run waits the same settle a graph read does,
- * then queues and says the render may not include it.
+ * Fails closed BEFORE dispatch, so no prompt can exist: when a snapshotted edit
+ * is still unsettled at the end of the bound; when the receiving canvas cannot
+ * be identified; or when it is not provably the same canvas after the wait
+ * (tab, pin, connection generation/incarnation, workflow stamp, graph-scope
+ * witness). It never rebinds, re-dispatches an edit, or replays a run. A
+ * retry_of whose original already has a local receipt reconciles straight
+ * through; any other retry_of keeps its token in the refusal.
  */
 function withRunFreshnessBarrier(d: PanelToolDef): PanelToolDef {
   return {
     ...d,
     handler: async (args: Record<string, unknown>, ctx: PanelToolCtx): Promise<ToolResult> => {
-      const tabAtStart = ctx.tabId;
+      const retryOf =
+        typeof args.retry_of === "string" && args.retry_of !== "" ? args.retry_of : undefined;
       const bridge = ctx.bridge;
+      if (retryOf && originalRunSettledLocally(bridge, retryOf)) return d.handler(args, ctx);
+      const before = captureRunTargetWitness(ctx);
       const intents = [...(mutationIntents.get(ctx) ?? [])];
-      const awaited =
-        typeof bridge?.listAwaitedMutations === "function"
-          ? bridge.listAwaitedMutations(tabAtStart)
+      const edits =
+        typeof bridge?.listUnsettledMutations === "function"
+          ? bridge.listUnsettledMutations(before.tabId).filter((m) => editRelevantToRun(m, before))
           : [];
-      const timedOut = outstandingGraphEdits(bridge, tabAtStart);
-      if (intents.length || awaited.length || timedOut.length) {
-        const budgetMs = runFreshnessBarrierMs();
-        runFreshnessWaitObserver?.({
-          intents: intents.length,
-          awaited: awaited.length,
-          timedOut: timedOut.length,
-        });
-        await settleWithin(
-          Promise.all([
-            Promise.all(intents.map((intent) => intent.done)),
-            awaited.length && typeof bridge.waitForMutationReplies === "function"
-              ? bridge.waitForMutationReplies(
-                  awaited.map((m) => m.rid),
-                  budgetMs,
-                )
-              : undefined,
-            timedOut.length ? awaitOutstandingMutationSettle(bridge, tabAtStart) : undefined,
-          ]),
-          budgetMs,
-        );
-        if (ctx.tabId !== tabAtStart) {
-          return fail(
-            `panel_run was NOT dispatched — nothing was queued and the queue is untouched. This ` +
-              `session's canvas target changed from "${tabAtStart}" to "${ctx.tabId}" while the run ` +
-              `waited for earlier graph edits to be acknowledged, so those edits and this run no ` +
-              `longer address the same canvas. Nothing was rebound. Confirm which workflow you ` +
-              `mean (panel_graph_outline / panel_set_workflow_target), then call panel_run again — ` +
-              `do NOT pass retry_of: no run was dispatched, so there is nothing to dedupe.`,
-          );
-        }
-        const stillAwaited = new Set(
-          (typeof bridge.listAwaitedMutations === "function"
-            ? bridge.listAwaitedMutations(tabAtStart)
-            : []
-          ).map((m) => m.rid),
-        );
-        const unfinished = [
-          ...intents
-            .filter((intent) => !intent.finished)
-            .map((intent) => `${intent.tool} (call still in progress)`),
-          ...awaited
-            .filter((m) => stillAwaited.has(m.rid))
-            .map((m) => `${describeDeliveredEdit(m)} (delivered, awaiting the panel's reply)`),
-        ];
-        if (unfinished.length) {
-          return fail(
-            `panel_run was NOT dispatched — nothing was queued and the queue is untouched. ` +
-              `${unfinished.length} graph edit(s) issued on this canvas before this run were still ` +
-              `unacknowledged after ${(budgetMs / 1000).toFixed(1)}s: ${unfinished.join("; ")}. ` +
-              `Serializing the graph now would queue it WITHOUT them and render the previous ` +
-              `values (#2955). Wait for those calls to return and check that each reported ` +
-              `success (confirm the values with panel_query_graph if unsure), then call panel_run ` +
-              `again — do NOT pass retry_of: no run was dispatched, so there is nothing to dedupe.`,
-          );
-        }
+      if (intents.length === 0 && edits.length === 0) return d.handler(args, ctx);
+
+      const awaiting = edits.filter((m) => m.settlement === "awaiting");
+      runFreshnessWaitObserver?.({
+        intents: intents.length,
+        awaited: awaiting.length,
+        unknown: edits.length - awaiting.length,
+      });
+      const unverifiable = unverifiableRunTarget(before);
+      if (unverifiable) {
+        return runFreshnessRefusal(retryOf, [
+          `Earlier graph edits on this canvas are still outstanding, and ${unverifiable}, so ` +
+            `this run cannot prove that the graph it would serialize is the one those edits target.`,
+        ]);
       }
-      const unsettled = outstandingGraphEdits(bridge, ctx.tabId);
-      const res = await d.handler(args, ctx);
-      if (res.isError || unsettled.length === 0) return res;
-      return appendToolResultText(
-        res,
-        `\n\n[FRESHNESS] OUTCOME UNKNOWN: ${unsettled.length} earlier graph edit(s) on this tab ` +
-          `had timed out without the panel acknowledging them when this run was dispatched ` +
-          `(${unsettled.map((m) => `${describeDeliveredEdit(m)} retry_of:"${m.rid}"`).join(", ")}). ` +
-          `The queued render may not include them. Check the output; if a value is missing, ` +
-          `confirm it with panel_query_graph (or retry that edit with its retry_of token), then ` +
-          `run again (#2955).`,
+      // Live calls or awaited replies get graph_run's own window; edits that are
+      // already outcome-unknown get the #2527 settle a graph read gets.
+      const budgetMs =
+        intents.length > 0 || awaiting.length > 0
+          ? runFreshnessBarrierMs()
+          : outstandingMutationReadSettleMs();
+      await settleWithin(
+        Promise.all([
+          Promise.all(intents.map((intent) => intent.done)),
+          typeof bridge.waitForMutationSettlement === "function"
+            ? bridge.waitForMutationSettlement(
+                edits.map((m) => m.rid),
+                budgetMs,
+              )
+            : undefined,
+        ]),
+        budgetMs,
       );
+
+      const drift = runTargetDrift(before, captureRunTargetWitness(ctx));
+      if (drift) {
+        return runFreshnessRefusal(retryOf, [
+          `While this run waited for earlier graph edits, ${drift}, so the edits it waited for ` +
+            `and the canvas it would now serialize are not proven to be the same graph. Nothing ` +
+            `was rebound and nothing was replayed. Confirm the target (panel_graph_outline / ` +
+            `panel_set_workflow_target) before running.`,
+        ]);
+      }
+      const settlementOf = (rid: string) =>
+        typeof bridge.mutationSettlement === "function" ? bridge.mutationSettlement(rid) : "unknown";
+      const unfinished = [
+        ...intents
+          .filter((intent) => !intent.finished)
+          .map((intent) => `${intent.tool} (call still in progress)`),
+        ...edits
+          .filter((m) => settlementOf(m.rid) === "awaiting")
+          .map((m) => `${describeDeliveredEdit(m)} (delivered, awaiting the panel's reply)`),
+      ];
+      const unknown = edits.filter((m) => settlementOf(m.rid) === "unknown");
+      const failed = intents.filter((intent) => intent.finished && intent.failed);
+      const reasons: string[] = [];
+      if (failed.length) {
+        reasons.push(
+          `${failed.length} graph edit call(s) issued before this run FAILED: ` +
+            `${failed.map((intent) => intent.tool).join(", ")} returned an error. Queueing now ` +
+            `would render the graph without the change this run was issued after. Read that ` +
+            `call's result and fix or re-issue the edit — or, if you mean to render the graph as ` +
+            `it stands, call panel_run again on its own.`,
+        );
+      }
+      if (unfinished.length) {
+        reasons.push(
+          `${unfinished.length} graph edit(s) issued on this canvas before this run were still ` +
+            `unacknowledged after ${(budgetMs / 1000).toFixed(1)}s: ${unfinished.join("; ")}. ` +
+            `Serializing now would queue the graph WITHOUT them and render the previous values ` +
+            `(#2955). Wait for those calls to return and check that each reported success ` +
+            `(confirm the values with panel_query_graph if unsure).`,
+        );
+      }
+      if (unknown.length) {
+        reasons.push(
+          `${unknown.length} earlier graph edit(s) on this canvas have an UNKNOWN outcome — ` +
+            `delivered, but the reply timed out, the connection dropped, or the workflow was ` +
+            `replaced before the panel answered: ` +
+            unknown
+              .map(
+                (m) =>
+                  `${panelToolForGraphCmd(m.cmd) ?? m.cmd} ${describeDeliveredEdit(m)} ` +
+                  `(that edit's own token retry_of:"${m.rid}")`,
+              )
+              .join("; ") +
+            `. Each may have applied or may still apply, so the graph this run would serialize ` +
+            `is not known. Settle each first: re-issue that edit with its own retry_of token (the ` +
+            `panel reconciles it against the original instead of applying it twice), or wait ` +
+            `for its late acknowledgement — panel_run then proceeds.`,
+        );
+      }
+      if (reasons.length) return runFreshnessRefusal(retryOf, reasons);
+      // The handler still awaits (reachability, the graph lane) before graph_run
+      // is written. Hold the canvas proven above through to the bridge's final
+      // synchronous dispatch point, so a reconnect / re-hello / replacement in
+      // that window refuses there instead of dispatching onto the new canvas.
+      // Every graph_run the handler sends — including the #2537 and run-to-node
+      // re-issues — goes through this fence.
+      const fenced = Object.create(ctx) as PanelToolCtx;
+      fenced.call = async (cmd, timeoutMs, onDispatchedRid, beforeDispatch, options) => {
+        if (cmd.cmd !== "graph_run") {
+          return ctx.call(cmd, timeoutMs, onDispatchedRid, beforeDispatch, options);
+        }
+        let fenceDrift: string | null = null;
+        const res = await ctx.call(
+          cmd,
+          timeoutMs,
+          onDispatchedRid,
+          () => {
+            fenceDrift = runTargetDrift(before, captureRunTargetWitness(ctx));
+            if (fenceDrift) {
+              throw new Error(`panel_run refused graph_run at dispatch: ${fenceDrift}`);
+            }
+            beforeDispatch?.();
+          },
+          options,
+        );
+        if (fenceDrift) {
+          return runFreshnessRefusal(retryOf, [
+            `After the earlier graph edits settled, ${fenceDrift} before graph_run could be ` +
+              `written, so the canvas it would serialize is not proven to be the one those edits ` +
+              `target. The bridge refused the frame unsent. Nothing was rebound and nothing was ` +
+              `replayed. Confirm the target (panel_graph_outline / panel_set_workflow_target) ` +
+              `before running.`,
+          ]);
+        }
+        return res;
+      };
+      return d.handler(args, fenced);
     },
   };
 }
