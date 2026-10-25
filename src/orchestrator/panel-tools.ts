@@ -23,6 +23,7 @@
 // gating for panel_clear/panel_restart_comfyui) is IDENTICAL across providers,
 // so parity is automatic — neither path reimplements a tool.
 
+import { AsyncLocalStorage } from "node:async_hooks";
 import { z } from "zod";
 import { createHash, randomUUID } from "node:crypto";
 // #873 — the operator's tool-surface policy also governs the panel surface.
@@ -411,7 +412,11 @@ import {
   isMidCommandDisconnectTagged,
   isReplyTimeoutTagged,
   isRoutingAmbiguity,
+  replyLeavesOutcomeUnknown,
   requiresWorkflowStampEnforcement,
+  type DeliveredMutationReceipt,
+  type UncertainTarget,
+  type UnsettledMutation,
 } from "../services/ui-bridge.js";
 import {
   GRAPH_READ_CMD_BY_TOOL,
@@ -1449,6 +1454,15 @@ export const __panelToolsTestHooks = {
   setOutstandingMutationReadSettleMs(ms: number | null): void {
     outstandingMutationReadSettleMsOverride = ms;
   },
+  /** Shrink the #2955 panel_run wait for earlier unacknowledged graph edits. */
+  setRunFreshnessBarrierMs(ms: number | null): void {
+    runFreshnessBarrierMsOverride = ms;
+  },
+  /** #2955 — observe the moment panel_run starts waiting, and on what, so a test
+   *  can order its releases against the barrier instead of against a clock. */
+  setRunFreshnessWaitObserver(fn: ((snapshot: RunFreshnessSnapshot) => void) | null): void {
+    runFreshnessWaitObserver = fn;
+  },
   /** Mark a synthetic graph_run result as the bridge's authoritative reply timeout. */
   markRunReplyTimeout(res: ToolResult): ToolResult {
     Object.defineProperty(res, REPLY_TIMEOUT_RESULT, {
@@ -1565,6 +1579,18 @@ function outstandingMutationReadSettleMs(): number {
   return outstandingMutationReadSettleMsOverride ?? OUTSTANDING_MUTATION_READ_SETTLE_MS;
 }
 
+// #2955 — how long panel_run waits for graph edits issued BEFORE it to be
+// acknowledged before it refuses (nothing dispatched). The same window graph_run
+// itself is given to answer: a run is willing to wait for the edits it must
+// include as long as it waits for its own reply, and no longer.
+const RUN_FRESHNESS_BARRIER_MS = 20_000;
+let runFreshnessBarrierMsOverride: number | null = null;
+function runFreshnessBarrierMs(): number {
+  return runFreshnessBarrierMsOverride ?? RUN_FRESHNESS_BARRIER_MS;
+}
+type RunFreshnessSnapshot = { intents: number; awaited: number; unknown: number };
+let runFreshnessWaitObserver: ((snapshot: RunFreshnessSnapshot) => void) | null = null;
+
 const GRAPH_READ_SETTLE_CMDS: ReadonlySet<string> = new Set([
   ...Object.values(GRAPH_READ_CMD_BY_TOOL),
   "graph_get_subgraph",
@@ -1599,7 +1625,44 @@ function mutationIdentityMatches(
       sameMutationScalar(retryCmd.value, delivered.value)
     );
   }
+  // #2955 — a run token names ONE run: a different batch or branch is a different
+  // run, and must never be answered from (or deduped onto) another run's receipt.
+  if (retryCmd.cmd === "graph_run") {
+    return (
+      sameMutationScalar(retryCmd.batch_count ?? 1, delivered.batch_count ?? 1) &&
+      sameMutationScalar(retryCmd.to_node_id, delivered.to_node_id)
+    );
+  }
   if ("node_id" in delivered) return sameMutationScalar(retryCmd.node_id, delivered.node_id);
+  return true;
+}
+
+/**
+ * #2955 — may this retry reply settle an outcome-unknown receipt? Only a
+ * definite, applied answer. A deferral (`waiting_for_queue_idle`), the panel's
+ * still-running duplicate (an error), a queue-uncertain reply, an explicit
+ * `applied:false`, a timeout or a drop all leave the outcome unknown. A widget
+ * write must report the `set` it applied.
+ */
+function isTerminalReconcileReply(cmd: Record<string, unknown>, res: ToolResult): boolean {
+  if (res.isError || isReplyTimeoutResult(res) || isMidCommandDisconnectResult(res)) return false;
+  const body = parseToolResultJson(res);
+  if (!body) return false;
+  // The bridge's own settlement classification first (an explicitly unresolved
+  // `applied` or `queued_unknown` is never an outcome), then the stricter bar a
+  // RECONCILIATION needs: the retry must have applied — a deferral or an explicit
+  // `applied:false` is a definite answer, but not one that settles another rid.
+  if (
+    replyLeavesOutcomeUnknown({ ok: true, result: body }) ||
+    body.deferred === true ||
+    body.status === "waiting_for_queue_idle" ||
+    (Object.prototype.hasOwnProperty.call(body, "applied") && body.applied !== true)
+  ) {
+    return false;
+  }
+  if (cmd.cmd === "graph_set_widget") {
+    return !!body.set && typeof body.set === "object" && !Array.isArray(body.set);
+  }
   return true;
 }
 
@@ -21163,6 +21226,12 @@ function withRetryToken(d: PanelToolDef): PanelToolDef {
       // workflow". Answer from the receipt instead. A sibling mutation inside
       // the same handler (enter_subgraph during a set_widget retry) must not
       // carry this token at all.
+      // #2955 — the retry's own dispatch of the original's exact frame, and the rid
+      // it went out under, kept so the bridge can PROVE (same receiver, same exact
+      // command) that it settles the original — after the handler has judged it.
+      const reconcile: {
+        last: { cmd: Record<string, unknown>; res: ToolResult; retryRid?: string } | null;
+      } = { last: null };
       const wrapped = Object.create(ctx) as PanelToolCtx;
       wrapped.call = (
         cmd: Record<string, unknown>,
@@ -21185,9 +21254,20 @@ function withRetryToken(d: PanelToolDef): PanelToolDef {
           if (mutationIdentityMatches(cmd, original.frame)) {
             const replay: Record<string, unknown> = { ...original.frame, retry_of: retryOf };
             delete replay.rid;
-            return ctx.call(replay, timeoutMs, onDispatchedRid, beforeDispatch);
+            let retryRid: string | undefined;
+            const observeRetryRid = (dispatched: string): void => {
+              retryRid = dispatched;
+              onDispatchedRid?.(dispatched);
+            };
+            return ctx.call(replay, timeoutMs, observeRetryRid, beforeDispatch).then((res) => {
+              if (original.status !== "settled") reconcile.last = { cmd: replay, res, retryRid };
+              return res;
+            });
           }
         }
+        // #2955 — no full receipt for this token (never seen, or evicted to an
+        // uncertainty marker): nothing here can prove the retry is the original's
+        // exact command on its receiver, so this path never settles anything.
         return ctx.call(
           // Ask the RETRY MAP's question, not the workflow fence's (codex gate).
           // These were the same answer only while isMutatingGraphCommand
@@ -21209,6 +21289,20 @@ function withRetryToken(d: PanelToolDef): PanelToolDef {
         );
       };
       const out = await d.handler(args, wrapped);
+      // #2955 — the panel's rid ledger answers an exact retry of a retained
+      // original with the original's own outcome (awaiting it if still running),
+      // and runs the same fingerprint fresh only when it holds no record of it.
+      // Only a TERMINAL answer — not a deferral, a still-running duplicate, an
+      // uncertain queue reply — and a handler that accepted it settle the
+      // outcome-unknown receipt a run barrier is holding on.
+      const candidate = reconcile.last;
+      if (
+        candidate?.retryRid &&
+        !out.isError &&
+        isTerminalReconcileReply(candidate.cmd, candidate.res)
+      ) {
+        ctx.bridge?.markMutationReconciled?.(retryOf, candidate.retryRid);
+      }
       // Drained AFTER the handler, deliberately, for two measured reasons.
       //
       // (1) The drain is destructive. Draining first meant a handler that threw
@@ -21249,6 +21343,517 @@ function withRetryToken(d: PanelToolDef): PanelToolDef {
           ...out.content,
         ],
       };
+    },
+  };
+}
+
+/**
+ * #2955 — a mutating panel tool call that has started and not yet returned, on
+ * one tool session. Covers the whole handler, including the read-only preflight
+ * (graph_get_subgraph / graph_query / graph_outline) that runs BEFORE its write
+ * frame is sent — a window no bridge receipt can see. `failed` records how the
+ * call ENDED (an error result or a throw), because a run that depended on an
+ * edit must not treat "the call returned" as "the edit applied". `rids` are the
+ * mutation receipts the call itself dispatched (bounded; `ridOverflow` past the
+ * bound): a call that finishes without error has only proved its waiter
+ * completed — each of its receipts still needs its own definite outcome.
+ */
+type MutationIntent = {
+  tool: string;
+  finished: boolean;
+  failed: boolean;
+  done: Promise<void>;
+  rids: Set<string>;
+  ridOverflow: boolean;
+};
+
+/** Keyed by the session's ctx: one agent's overlapping calls share it. */
+const mutationIntents = new WeakMap<PanelToolCtx, Set<MutationIntent>>();
+
+/**
+ * #2955 — the intent a send() belongs to, carried by async context rather than by
+ * a delegating ctx: the handler keeps the session ctx itself (so a rebind or any
+ * ctx-keyed state behaves exactly as before), and two edit calls running at once
+ * on ONE ctx still get their own receipts. The bridge reads it synchronously at
+ * send() entry (setMutationOwnership) — every send path, ctx.call or a direct
+ * ctx.bridge.send, is covered.
+ */
+const intentScope = new AsyncLocalStorage<MutationIntent>();
+const liveIntentObjects = new WeakSet<MutationIntent>();
+const MAX_INTENT_RECEIPTS = 64;
+const intentTrackedBridges = new WeakSet<object>();
+
+function ensureIntentReceiptTracking(bridge: PanelToolCtx["bridge"]): void {
+  if (!bridge || typeof bridge.setMutationOwnership !== "function") return;
+  if (intentTrackedBridges.has(bridge)) return;
+  intentTrackedBridges.add(bridge);
+  bridge.setMutationOwnership(
+    () => intentScope.getStore(),
+    (rid, owner) => {
+      if (!owner || typeof owner !== "object" || !liveIntentObjects.has(owner as MutationIntent)) return;
+      const intent = owner as MutationIntent;
+      // Only while the call is running: nothing may grow a finished intent.
+      if (intent.finished) return;
+      if (intent.rids.size >= MAX_INTENT_RECEIPTS) {
+        intent.ridOverflow = true;
+        return;
+      }
+      intent.rids.add(rid);
+    },
+  );
+}
+
+function withMutationIntent(d: PanelToolDef): PanelToolDef {
+  return {
+    ...d,
+    handler: async (args: Record<string, unknown>, ctx: PanelToolCtx): Promise<ToolResult> => {
+      let finish = (): void => {};
+      const intent: MutationIntent = {
+        tool: d.name,
+        finished: false,
+        failed: true,
+        done: new Promise<void>((resolve) => {
+          finish = resolve;
+        }),
+        rids: new Set<string>(),
+        ridOverflow: false,
+      };
+      liveIntentObjects.add(intent);
+      ensureIntentReceiptTracking(ctx.bridge);
+      let live = mutationIntents.get(ctx);
+      if (!live) {
+        live = new Set();
+        mutationIntents.set(ctx, live);
+      }
+      live.add(intent);
+      try {
+        const res = await intentScope.run(intent, () => d.handler(args, ctx));
+        intent.failed = res.isError === true;
+        return res;
+      } finally {
+        intent.finished = true;
+        live.delete(intent);
+        finish();
+      }
+    },
+  };
+}
+
+function describeDeliveredEdit(m: Pick<DeliveredMutationReceipt, "cmd" | "frame">): string {
+  const node = m.frame.node_id !== undefined ? ` node ${String(m.frame.node_id)}` : "";
+  const widget = typeof m.frame.widget === "string" ? ` widget "${m.frame.widget}"` : "";
+  return `"${m.cmd}"${node}${widget}`;
+}
+
+async function settleWithin(work: Promise<unknown>, ms: number): Promise<void> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    await Promise.race([
+      work.then(
+        () => undefined,
+        () => undefined,
+      ),
+      new Promise<void>((resolve) => {
+        timer = setTimeout(resolve, Math.max(0, ms));
+      }),
+    ]);
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+}
+
+/**
+ * #2955 — the canvas a run would serialize, as the existing write fences
+ * identify it: the session's tab and workflow pin, the receiving connection's
+ * hello generation + incarnation (panelWriteConnectionIdentity, as promoted
+ * writes bind it), the bridge's workflow stamp for the tab (workflowUuidFor, the
+ * uuid graph_run is stamped with), and the panel's last structured graph-scope
+ * witness (promotedScopeFor).
+ */
+type RunTargetWitness = {
+  tabId: string;
+  pin: string;
+  connection: { generation: number; tabSessionId: string } | undefined;
+  workflow: TabWorkflowUuidRead;
+  scope: TabPromotedScopeRead;
+};
+
+function captureRunTargetWitness(ctx: PanelToolCtx): RunTargetWitness {
+  let connection: { generation: number; tabSessionId: string } | undefined;
+  try {
+    connection = panelWriteConnectionIdentity(ctx);
+  } catch {
+    connection = undefined;
+  }
+  const bridge = ctx.bridge;
+  let workflow: TabWorkflowUuidRead = {
+    known: false,
+    reason: "this bridge exposes no workflow identity",
+  };
+  if (typeof bridge?.workflowUuidFor === "function") {
+    workflow = bridge.workflowUuidFor(ctx.tabId);
+  }
+  let scope: TabPromotedScopeRead = {
+    known: false,
+    reason: "this bridge exposes no graph-scope witness",
+  };
+  if (typeof bridge?.promotedScopeFor === "function") {
+    try {
+      scope = bridge.promotedScopeFor(ctx.tabId);
+    } catch {
+      scope = { known: false, reason: "the graph-scope witness became unreadable" };
+    }
+  }
+  return {
+    tabId: ctx.tabId,
+    pin: JSON.stringify(ctx.workflowTarget?.get(ctx.tabId) ?? null),
+    connection,
+    workflow,
+    scope,
+  };
+}
+
+/** Why `w` cannot certify a canvas at all, or null. */
+function unverifiableRunTarget(w: RunTargetWitness): string | null {
+  if (!isUsablePanelConnectionIdentity(w.connection)) {
+    return "the receiving panel connection's identity could not be read";
+  }
+  if (w.workflow.known !== true) {
+    return `the tab's workflow identity could not be read (${w.workflow.reason})`;
+  }
+  return null;
+}
+
+/** Why the canvas after the wait is not proven to be the one before it, or null. */
+function runTargetDrift(before: RunTargetWitness, after: RunTargetWitness): string | null {
+  if (after.tabId !== before.tabId) {
+    return `the session's canvas target changed from "${before.tabId}" to "${after.tabId}"`;
+  }
+  if (after.pin !== before.pin) return "the session's workflow pin changed";
+  const unverifiable = unverifiableRunTarget(after);
+  if (unverifiable) return `${unverifiable} after the wait`;
+  if (
+    !isUsablePanelConnectionIdentity(before.connection) ||
+    !isUsablePanelConnectionIdentity(after.connection) ||
+    !samePanelConnectionIdentity(before.connection, after.connection)
+  ) {
+    return "the panel connection was replaced or re-registered (a reconnect or re-hello)";
+  }
+  if (before.workflow.known !== true || after.workflow.known !== true) {
+    return "the tab's workflow identity became unverifiable";
+  }
+  if (before.workflow.uuid !== after.workflow.uuid) return "the workflow on that tab changed";
+  if (before.scope.known) {
+    if (!after.scope.known) return "the canvas graph identity became unverifiable";
+    if (
+      before.scope.scope !== after.scope.scope ||
+      before.scope.ownerNodeId !== after.scope.ownerNodeId ||
+      before.scope.workflowUuid !== after.scope.workflowUuid ||
+      before.scope.graphIdentity !== after.scope.graphIdentity
+    ) {
+      return "the canvas graph identity changed";
+    }
+  }
+  return null;
+}
+
+/**
+ * #2955 — does an edit received by browser document `received` bear on a run
+ * whose receiving document is the witness's? Only a PROVEN different document
+ * (two distinct `tab_session_id`s: two in-memory graphs) is unaffected. An
+ * unknown or anonymous identity on either side cannot be told apart from the
+ * run's document — anonymous ids are minted per connection, so a surviving
+ * document that reconnects gets a new one — and stays relevant.
+ */
+function incarnationRelevant(received: string | undefined, w: RunTargetWitness): boolean {
+  const target = w.connection?.tabSessionId;
+  if (!received || !target || received.startsWith("anon:") || target.startsWith("anon:")) return true;
+  return received === target;
+}
+
+/** An evicted-uncertainty marker binds like an unsettled edit: by document and workflow stamp. */
+function uncertaintyRelevantToRun(t: UncertainTarget, w: RunTargetWitness): boolean {
+  if (!incarnationRelevant(t.incarnation, w)) return false;
+  if (t.unstamped || w.workflow.known !== true || w.workflow.uuid === undefined) return true;
+  return t.workflowUuids.includes(w.workflow.uuid);
+}
+
+/**
+ * An unsettled edit received by a DIFFERENT proven browser document, or stamped
+ * for a DIFFERENT workflow than the one the run would be stamped with, cannot
+ * apply to this graph — another document is another in-memory graph, and the
+ * panel's write-time stamp fence refuses a mismatched workflow. Anything
+ * unstamped, anonymous or unverifiable stays relevant.
+ */
+function editRelevantToRun(m: UnsettledMutation, w: RunTargetWitness): boolean {
+  if (!incarnationRelevant(m.incarnation, w)) return false;
+  const stamped = typeof m.frame.workflow_uuid === "string" ? m.frame.workflow_uuid : undefined;
+  if (stamped === undefined || w.workflow.known !== true || w.workflow.uuid === undefined) return true;
+  return stamped === w.workflow.uuid;
+}
+
+function runFreshnessRefusal(retryOf: string | undefined, reasons: string[]): ToolResult {
+  const why = reasons.join(" ");
+  if (retryOf) {
+    return fail(
+      `panel_run (retry_of:"${retryOf}") was NOT dispatched — this retry attempt sent nothing to ` +
+        `the panel. The ORIGINAL run you are retrying is still outcome-UNKNOWN: it may already be ` +
+        `queued or rendering, and this refusal says nothing about it. ${why} Do NOT re-run ` +
+        `panel_run without retry_of — that could queue a duplicate of the original. Check queue ` +
+        `(action:"list") or get_history for it, and once the above is resolved call panel_run ` +
+        `again with the SAME retry_of:"${retryOf}" so the panel reconciles it against the ` +
+        `original instead of queueing it twice.`,
+    );
+  }
+  return fail(
+    `panel_run was NOT dispatched — this attempt sent nothing to the panel, nothing was queued, ` +
+      `and the queue is untouched. ${why} Call panel_run again once that is resolved; this ` +
+      `attempt minted no retry_of token, so there is nothing of its own to dedupe (if you are ` +
+      `reconciling an EARLIER outcome-unknown panel_run, keep passing that run's own retry_of).`,
+  );
+}
+
+/**
+ * #2955 — panel_run must not serialize the graph while edits the caller issued
+ * BEFORE it are unacknowledged or of unknown outcome.
+ *
+ * The bridge's graph lane releases a targeted mutation as soon as its frame is
+ * written (#2559), and the frontend's graph_set_widget awaits /object_info work
+ * before it applies the value. So a graph_run issued alongside a write — or while
+ * that write's handler is still in its preflight — reaches the serializer first
+ * and queues the PREVIOUS values; the write then acks `set` and the run reports
+ * queued.
+ *
+ * The barrier snapshots what is outstanding when the run STARTS — this session's
+ * in-progress mutating calls, and every edit delivered to this tab whose outcome
+ * is not definite (awaiting its reply, or unknown after a timeout / drop /
+ * same-tab replacement) — and waits for exactly those to SETTLE: answered,
+ * acknowledged late, or reconciled by an exact retry_of. Edits issued after the
+ * run started are not waited for. It runs before the handler, so the duplicate
+ * fence and everything after it read post-wait state.
+ *
+ * Fails closed BEFORE dispatch, so no prompt can exist: when a snapshotted edit
+ * is still unsettled at the end of the bound; when the receiving canvas cannot
+ * be identified; or when it is not provably the same canvas after the wait
+ * (tab, pin, connection generation/incarnation, workflow stamp, graph-scope
+ * witness). It never rebinds, re-dispatches an edit, or replays a run. A
+ * retry_of gets no shortcut: while edits are outstanding it is refused like a
+ * fresh run, but its refusal keeps the ORIGINAL run's token and outcome-unknown
+ * guidance. Receipts the bounded cache had to forget still count (uncertainty
+ * markers): forgotten history is never read as freshness.
+ */
+function withRunFreshnessBarrier(d: PanelToolDef): PanelToolDef {
+  return {
+    ...d,
+    handler: async (args: Record<string, unknown>, ctx: PanelToolCtx): Promise<ToolResult> => {
+      const retryOf =
+        typeof args.retry_of === "string" && args.retry_of !== "" ? args.retry_of : undefined;
+      const bridge = ctx.bridge;
+      const before = captureRunTargetWitness(ctx);
+      const intents = [...(mutationIntents.get(ctx) ?? [])];
+      const edits =
+        typeof bridge?.listUnsettledMutations === "function"
+          ? bridge.listUnsettledMutations(before.tabId).filter((m) => editRelevantToRun(m, before))
+          : [];
+      const evictedNow = () =>
+        typeof bridge?.listUncertainTargets === "function"
+          ? bridge.listUncertainTargets(before.tabId).filter((t) => uncertaintyRelevantToRun(t, before))
+          : [];
+      const evicted = evictedNow();
+      if (intents.length === 0 && edits.length === 0 && evicted.length === 0) {
+        return d.handler(args, ctx);
+      }
+
+      const awaiting = edits.filter((m) => m.settlement === "awaiting");
+      runFreshnessWaitObserver?.({
+        intents: intents.length,
+        awaited: awaiting.length,
+        unknown: edits.length - awaiting.length + evicted.reduce((n, t) => n + t.count, 0),
+      });
+      const unverifiable = unverifiableRunTarget(before);
+      if (unverifiable) {
+        return runFreshnessRefusal(retryOf, [
+          `Earlier graph edits on this canvas are still outstanding, and ${unverifiable}, so ` +
+            `this run cannot prove that the graph it would serialize is the one those edits target.`,
+        ]);
+      }
+      // Live calls or awaited replies get graph_run's own window; edits that are
+      // already outcome-unknown get the #2527 settle a graph read gets.
+      const budgetMs =
+        intents.length > 0 || awaiting.length > 0
+          ? runFreshnessBarrierMs()
+          : outstandingMutationReadSettleMs();
+      const waitStartedAt = Date.now();
+      await settleWithin(
+        Promise.all([
+          Promise.all(intents.map((intent) => intent.done)),
+          typeof bridge.waitForMutationSettlement === "function"
+            ? bridge.waitForMutationSettlement(
+                [...edits.map((m) => m.rid), ...evicted.flatMap((t) => t.rids)],
+                budgetMs,
+              )
+            : undefined,
+        ]),
+        budgetMs,
+      );
+      // #2955 — the receipts the SNAPSHOTTED edit calls dispatched, including those
+      // sent after the snapshot (an intent caught in its preflight had none yet).
+      // Each needs its own definite outcome: a call that returned without error
+      // may only have had its waiter completed (a #2559 borrowed ack) or been told
+      // applied:"unknown". Receipts of edits issued AFTER the run started are not
+      // here — the run's ordering contract is unchanged.
+      const snapshotRids = new Set(edits.map((m) => m.rid));
+      const owned = [...new Set(intents.flatMap((intent) => [...intent.rids]))].filter(
+        (rid) => !snapshotRids.has(rid),
+      );
+      if (owned.length && typeof bridge.waitForMutationSettlement === "function") {
+        const remaining = Math.max(0, waitStartedAt + budgetMs - Date.now());
+        await settleWithin(bridge.waitForMutationSettlement(owned, remaining), remaining);
+      }
+
+      const drift = runTargetDrift(before, captureRunTargetWitness(ctx));
+      if (drift) {
+        return runFreshnessRefusal(retryOf, [
+          `While this run waited for earlier graph edits, ${drift}, so the edits it waited for ` +
+            `and the canvas it would now serialize are not proven to be the same graph. Nothing ` +
+            `was rebound and nothing was replayed. Confirm the target (panel_graph_outline / ` +
+            `panel_set_workflow_target) before running.`,
+        ]);
+      }
+      const settlementOf = (rid: string) =>
+        typeof bridge.mutationSettlement === "function" ? bridge.mutationSettlement(rid) : "unknown";
+      const unfinished = [
+        ...intents
+          .filter((intent) => !intent.finished)
+          .map((intent) => `${intent.tool} (call still in progress)`),
+        ...edits
+          .filter((m) => settlementOf(m.rid) === "awaiting")
+          .map((m) => `${describeDeliveredEdit(m)} (delivered, awaiting the panel's reply)`),
+      ];
+      const ownedOpen = owned
+        .map((rid) => {
+          const peek = typeof bridge.peekDeliveredMutation === "function" ? bridge.peekDeliveredMutation(rid) : undefined;
+          return { rid, cmd: peek?.cmd ?? "graph mutation", frame: peek?.frame ?? {}, settlement: settlementOf(rid) };
+        })
+        .filter((m) => m.settlement !== "settled");
+      for (const m of ownedOpen) {
+        if (m.settlement === "awaiting") {
+          unfinished.push(`${describeDeliveredEdit(m)} (dispatched by that call, awaiting the panel's reply)`);
+        }
+      }
+      const unknown: Array<{ rid: string; cmd: string; frame: Record<string, unknown> }> = [
+        ...edits.filter((m) => settlementOf(m.rid) === "unknown"),
+        ...ownedOpen.filter((m) => m.settlement === "unknown"),
+      ];
+      const failed = intents.filter((intent) => intent.finished && intent.failed);
+      const reasons: string[] = [];
+      const overflowed = intents.filter((intent) => intent.ridOverflow);
+      if (overflowed.length) {
+        reasons.push(
+          `${overflowed.map((intent) => intent.tool).join(", ")} dispatched more than ` +
+            `${MAX_INTENT_RECEIPTS} graph edits, more than this run can track individually, so it ` +
+            `cannot prove they all settled. Read the canvas with panel_query_graph, then call ` +
+            `panel_run again on its own.`,
+        );
+      }
+      if (failed.length) {
+        reasons.push(
+          `${failed.length} graph edit call(s) issued before this run FAILED: ` +
+            `${failed.map((intent) => intent.tool).join(", ")} returned an error. Queueing now ` +
+            `would render the graph without the change this run was issued after. Read that ` +
+            `call's result and fix or re-issue the edit — or, if you mean to render the graph as ` +
+            `it stands, call panel_run again on its own.`,
+        );
+      }
+      if (unfinished.length) {
+        reasons.push(
+          `${unfinished.length} graph edit(s) issued on this canvas before this run were still ` +
+            `unacknowledged after ${(budgetMs / 1000).toFixed(1)}s: ${unfinished.join("; ")}. ` +
+            `Serializing now would queue the graph WITHOUT them and render the previous values ` +
+            `(#2955). Wait for those calls to return and check that each reported success ` +
+            `(confirm the values with panel_query_graph if unsure).`,
+        );
+      }
+      if (unknown.length) {
+        reasons.push(
+          `${unknown.length} earlier graph edit(s) on this canvas have an UNKNOWN outcome — ` +
+            `delivered, but the reply timed out, the connection dropped, the workflow was ` +
+            `replaced, or the panel's answer did not settle it (an acknowledgement borrowed from ` +
+            `another request, or an explicit unknown outcome): ` +
+            unknown
+              .map(
+                (m) =>
+                  `${panelToolForGraphCmd(m.cmd) ?? m.cmd} ${describeDeliveredEdit(m)} ` +
+                  `(that edit's own token retry_of:"${m.rid}")`,
+              )
+              .join("; ") +
+            `. Each may have applied or may still apply, so the graph this run would serialize ` +
+            `is not known. Settle each first: re-issue that edit with its own retry_of token (the ` +
+            `panel reconciles it against the original instead of applying it twice), or wait ` +
+            `for its late acknowledgement — panel_run then proceeds.`,
+        );
+      }
+      const forgotten = evictedNow();
+      if (forgotten.length) {
+        const total = forgotten.reduce((n, t) => n + t.count, 0);
+        const tracked = forgotten.flatMap((t) => t.rids);
+        const cmds = [...new Set(forgotten.flatMap((t) => t.cmds))];
+        reasons.push(
+          `${total} earlier graph edit(s) on this canvas were dropped from the bridge's bounded ` +
+            `receipt memory while their outcome was still UNKNOWN (${cmds.join(", ") || "unrecorded commands"}). ` +
+            `Forgotten history is not freshness: they may have applied or may still apply. ` +
+            (tracked.length
+              ? `Their command details were not kept, so a retry cannot prove it re-issued the ` +
+                `same command on the same canvas and does NOT clear them; each tracked one ` +
+                `(${tracked.map((rid) => `retry_of:"${rid}"`).join(", ")}) clears only on its own ` +
+                `late acknowledgement. `
+              : "") +
+            (total > tracked.length
+              ? `${total - tracked.length} of them were not individually tracked and cannot be ` +
+                `cleared in this orchestrator process: a disconnect proves nothing about the browser ` +
+                `document that received them. Runs on a DIFFERENT browser tab's canvas are not ` +
+                `affected by them. `
+              : ""),
+        );
+      }
+      if (reasons.length) return runFreshnessRefusal(retryOf, reasons);
+      // The handler still awaits (reachability, the graph lane) before graph_run
+      // is written. Hold the canvas proven above through to the bridge's final
+      // synchronous dispatch point, so a reconnect / re-hello / replacement in
+      // that window refuses there instead of dispatching onto the new canvas.
+      // Every graph_run the handler sends — including the #2537 and run-to-node
+      // re-issues — goes through this fence.
+      const fenced = Object.create(ctx) as PanelToolCtx;
+      fenced.call = async (cmd, timeoutMs, onDispatchedRid, beforeDispatch, options) => {
+        if (cmd.cmd !== "graph_run") {
+          return ctx.call(cmd, timeoutMs, onDispatchedRid, beforeDispatch, options);
+        }
+        let fenceDrift: string | null = null;
+        const res = await ctx.call(
+          cmd,
+          timeoutMs,
+          onDispatchedRid,
+          () => {
+            fenceDrift = runTargetDrift(before, captureRunTargetWitness(ctx));
+            if (fenceDrift) {
+              throw new Error(`panel_run refused graph_run at dispatch: ${fenceDrift}`);
+            }
+            beforeDispatch?.();
+          },
+          options,
+        );
+        if (fenceDrift) {
+          return runFreshnessRefusal(retryOf, [
+            `After the earlier graph edits settled, ${fenceDrift} before graph_run could be ` +
+              `written, so the canvas it would serialize is not proven to be the one those edits ` +
+              `target. The bridge refused the frame unsent. Nothing was rebound and nothing was ` +
+              `replayed. Confirm the target (panel_graph_outline / panel_set_workflow_target) ` +
+              `before running.`,
+          ]);
+        }
+        return res;
+      };
+      return d.handler(args, fenced);
     },
   };
 }
@@ -30245,7 +30850,14 @@ CHECKED FOR YOU: the graph read this message prescribes was just run, and it ` +
   ];
   // #694: every MUTATING panel tool (RETRY_TOKEN_CMD_BY_TOOL) accepts the explicit
   // retry token in its schema and forwards it, untouched, on its command frames.
-  return defs.map((d) => (d.name in RETRY_TOKEN_CMD_BY_TOOL ? withRetryToken(d) : d));
+  // #2955: those same tools register an in-progress intent, and panel_run waits
+  // for the ones that started before it. Both are OUTERMOST so they see the
+  // session ctx itself, not withRetryToken's per-call delegate.
+  return defs.map((d) => {
+    if (!(d.name in RETRY_TOKEN_CMD_BY_TOOL)) return d;
+    const tokened = withRetryToken(d);
+    return d.name === "panel_run" ? withRunFreshnessBarrier(tokened) : withMutationIntent(tokened);
+  });
 }
 
 /**
