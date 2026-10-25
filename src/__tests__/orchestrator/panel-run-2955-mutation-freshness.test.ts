@@ -134,6 +134,8 @@ type PanelOpts = {
   duplicateBudgetMs?: number;
   /** A retry the ledger does not know is parked (defer_until_idle-shaped reply). */
   deferUnknownRetry?: boolean;
+  /** Called for every frame the panel receives, before it is answered. */
+  onFrame?: (msg: Record<string, unknown>) => void;
 };
 
 type ScriptedPanel = {
@@ -256,6 +258,7 @@ function attachPanel(sock: WebSocket, opts: PanelOpts = {}): ScriptedPanel {
     const msg = JSON.parse(buf.toString()) as Record<string, unknown>;
     if (typeof msg.rid !== "string" || typeof msg.cmd !== "string") return;
     const rid = msg.rid;
+    opts.onFrame?.(msg);
     if (opts.dropCmd && msg.cmd === opts.dropCmd) {
       dropped.push(msg);
       return;
@@ -880,7 +883,24 @@ describe("panel_run freshness barrier never releases onto a different graph (#29
   });
 
   it("a re-hello AFTER the wait but before graph_run is written is refused by the dispatch fence", async () => {
-    const panel = await connected({ holdRead: "graph_get_errors" });
+    // panel_set_widget ends with ONE post-write graph_query read-back (#2933), and
+    // graph reads hold this tab's graph lane until answered (#2069). Parked before
+    // the write is released, the lane read would queue that read-back behind
+    // it, so `await write` could not return until the parked read timed out.
+    // The lane read is therefore parked while the read-back is being answered: it
+    // is dispatched (and held) after the read-back and before graph_run, which
+    // queues behind it, so the re-hello lands between the barrier and dispatch.
+    let read: Promise<unknown> | undefined;
+    let writeReleased = false;
+    const panel = await connected({
+      holdRead: "graph_get_errors",
+      onFrame: (msg) => {
+        if (!read && writeReleased && msg.cmd === "graph_query" && msg.fields === "detail") {
+          // A read now occupies the tab's graph lane, so graph_run will queue behind it.
+          read = bridge.send({ cmd: "graph_get_errors" }, { tabId: TAB, timeoutMs: 5000 });
+        }
+      },
+    });
     const ctx = newCtx();
     let runCalled: () => void = () => {};
     const runCallSeen = new Promise<void>((resolve) => {
@@ -897,11 +917,10 @@ describe("panel_run freshness barrier never releases onto a different graph (#29
     const barrier = observeBarrier();
     const run = tracked(panelRun(ctx));
     expect((await firstOf(barrier, panel)).kind).toBe("barrier");
-    // A read now occupies the tab's graph lane, so graph_run will queue behind it.
-    const read = bridge.send({ cmd: "graph_get_errors" }, { tabId: TAB, timeoutMs: 5000 });
-    await waitFor(() => expect(panel.heldReadCount).toBe(1));
 
+    writeReleased = true;
     panel.writes[0]?.release();
+    await waitFor(() => expect(panel.heldReadCount).toBe(1));
     expect((await write).isError).not.toBe(true);
     await runCallSeen; // the barrier passed; the handler is dispatching graph_run
     const before = bridge.tabConnectionIdentity(TAB)?.generation;
@@ -1404,6 +1423,14 @@ describe("retry_of settles an unknown edit only on proven same-receiver, same-co
       slowWriteCtx(5000),
     );
     await panel.writesArrived(2);
+    // The graph already holds the value: the original's apply landed, but its reply
+    // never did, which is the outcome-unknown case. panel_set_widget's single
+    // post-write read-back (#2933) therefore observes it, and the retry handler
+    // succeeds. That makes the bridge's own-rid check the ONLY thing standing
+    // between the borrowed ack and a settled original; were the graph still old,
+    // a read-back mismatch would block reconciliation on its own and this test
+    // would no longer exercise that check.
+    panel.values.filename_prefix = NEW.filename_prefix;
     // An ack under a rid nobody is waiting on, for the same node: the bridge hands it
     // to the retry's pending waiter so that call is not stranded (#2559).
     panel.sock.send(
@@ -1413,9 +1440,35 @@ describe("retry_of settles an unknown edit only on proven same-receiver, same-co
         result: { set: { node_id: SAVE_NODE, widget: "filename_prefix", previous: OLD.filename_prefix, value: NEW.filename_prefix } },
       }),
     );
-    expect((await retry).isError).not.toBe(true);
+    const retryRes = await retry;
+    expect(retryRes.isError).not.toBe(true);
+    expect(
+      JSON.parse(retryRes.content.find((c) => c.type === "text")?.text ?? "null").post_write_readback,
+    ).toMatchObject({ status: "matched" });
     expect(bridge.mutationSettlement(token), "a borrowed ack is not the retry's own answer").toBe("unknown");
-    expect((await panelRun(newCtx())).isError).toBe(true);
+    // Nor did it settle the retry's OWN receipt: completing a waiter is not an
+    // outcome. Each unknown must block on its own, so the run's refusal names BOTH
+    // tokens and neither is masked by the other.
+    const retryRid = panel.writes[1]?.msg.rid as string;
+    expect(retryRid).toBeTruthy();
+    expect(bridge.mutationSettlement(retryRid), "the borrowed ack did not settle the retry's own receipt").toBe(
+      "unknown",
+    );
+    const blocked = await panelRun(newCtx());
+    expect(blocked.isError).toBe(true);
+    expect(textOf(blocked)).toContain(`that edit's own token retry_of:"${token}"`);
+    expect(textOf(blocked)).toContain(`that edit's own token retry_of:"${retryRid}"`);
+    expect(panel.runs).toHaveLength(0);
+
+    // The retry's OWN definite reply settles the retry's receipt only. The original
+    // stays unknown, so the run is still refused and still queues nothing.
+    panel.writes[1]?.release();
+    await waitFor(() => expect(bridge.mutationSettlement(retryRid)).toBe("settled"));
+    expect(bridge.mutationSettlement(token)).toBe("unknown");
+    const stillBlocked = await panelRun(newCtx());
+    expect(stillBlocked.isError).toBe(true);
+    expect(textOf(stillBlocked)).toContain(`that edit's own token retry_of:"${token}"`);
+    expect(textOf(stillBlocked)).not.toContain(`retry_of:"${retryRid}"`);
     expect(panel.runs).toHaveLength(0);
   });
 
@@ -1711,22 +1764,40 @@ describe("receipts dispatched by a snapshotted edit call AFTER the snapshot stil
     return { write, run, rid: panel.writes[0]?.msg.rid as string };
   }
 
+  /**
+   * panel_set_widget ends with ONE post-write read-back (#2933). The held write is
+   * not applied, so put the value on the graph WITHOUT settling that write. The
+   * borrowed ack then completes the setter with a matched read-back, and the run
+   * is refused for the write's own still-unknown receipt alone, not for a
+   * read-back mismatch, which would fail the call and mask the receipt.
+   */
+  function graphHoldsValueButWriteIsHeld(panel: ScriptedPanel, widget: keyof Widgets, value: string) {
+    panel.values[widget] = value;
+  }
+
+  const readbackStatus = (res: ToolResult) =>
+    (JSON.parse(res.content.find((c) => c.type === "text")?.text ?? "null") as Record<string, unknown> | null)
+      ?.post_write_readback;
+
   it("a preflight write later completed by a BORROWED ack: zero graph_run until its own definite reply", async () => {
     __panelToolsTestHooks.setRunFreshnessBarrierMs(400);
     const panel = await connected();
     const ctx = newCtx();
     const { write, run, rid } = await preflightRun(panel, ctx);
 
+    graphHoldsValueButWriteIsHeld(panel, "filename_prefix", NEW.filename_prefix);
     panel.sock.send(
       JSON.stringify({ rid: "orphan-ack-2955-r6", ok: true, result: setResult(SAVE_NODE, "filename_prefix", NEW.filename_prefix) }),
     );
     const writeRes = await write;
     expect(writeRes.isError, "the borrowed ack completes the setter without error").not.toBe(true);
+    expect(readbackStatus(writeRes)).toMatchObject({ status: "matched" });
     expect(bridge.mutationSettlement(rid)).toBe("unknown");
 
     const res = await run.promise;
     expect(res.isError).toBe(true);
     expect(textOf(res)).toContain(`that edit's own token retry_of:"${rid}"`);
+    expect(textOf(res), "refused for the unknown receipt, not a failed call").not.toMatch(/FAILED:/);
     expect(panel.runs, "graph_run must not overtake the still-held write").toHaveLength(0);
     expect(panel.applyCount).toBe(0);
 
@@ -1744,10 +1815,13 @@ describe("receipts dispatched by a snapshotted edit call AFTER the snapshot stil
     const ctx = newCtx();
     const { write, run, rid } = await preflightRun(panel, ctx);
 
+    graphHoldsValueButWriteIsHeld(panel, "filename_prefix", NEW.filename_prefix);
     panel.sock.send(
       JSON.stringify({ rid: "orphan-ack-2955-r6b", ok: true, result: setResult(SAVE_NODE, "filename_prefix", NEW.filename_prefix) }),
     );
-    expect((await write).isError).not.toBe(true);
+    const writeRes = await write;
+    expect(writeRes.isError).not.toBe(true);
+    expect(readbackStatus(writeRes)).toMatchObject({ status: "matched" });
     expect(run.settled(), "still waiting on the write's own outcome").toBe(false);
     expect(panel.runs).toHaveLength(0);
     panel.writes[0]?.release();
@@ -1772,11 +1846,15 @@ describe("receipts dispatched by a snapshotted edit call AFTER the snapshot stil
         result: { applied: "unknown", ...setResult(SAVE_NODE, "filename_prefix", NEW.filename_prefix) },
       }),
     );
-    await write;
+    // The setter takes no read-back for an explicit applied:"unknown" (#2933 reads back
+    // only definite acknowledgements), so it returns without error and the run is
+    // refused for the unknown receipt alone.
+    expect((await write).isError).not.toBe(true);
     expect(bridge.mutationSettlement(rid)).toBe("unknown");
     const res = await run.promise;
     expect(res.isError).toBe(true);
     expect(textOf(res)).toContain(`retry_of:"${rid}"`);
+    expect(textOf(res), "refused for the unknown receipt, not a failed call").not.toMatch(/FAILED:/);
     expect(panel.runs).toHaveLength(0);
 
     panel.sock.send(
@@ -1805,13 +1883,17 @@ describe("receipts dispatched by a snapshotted edit call AFTER the snapshot stil
 
     // The prefix write gets its own definite reply; the text write only a borrowed ack.
     panel.writes.find((w) => w.msg.rid === prefixRid)?.release();
+    graphHoldsValueButWriteIsHeld(panel, "text", NEW.text);
     panel.sock.send(JSON.stringify({ rid: "orphan-ack-2955-r6c", ok: true, result: setResult(PROMPT_NODE, "text", NEW.text) }));
     expect((await prefix).isError).not.toBe(true);
-    expect((await text).isError).not.toBe(true);
+    const textRes = await text;
+    expect(textRes.isError).not.toBe(true);
+    expect(readbackStatus(textRes)).toMatchObject({ status: "matched" });
 
     const res = await run.promise;
     expect(res.isError).toBe(true);
     expect(textOf(res)).toContain(`retry_of:"${textRid}"`);
+    expect(textOf(res), "refused for the unknown receipt, not a failed call").not.toMatch(/FAILED:/);
     expect(textOf(res), "the settled write is not reported as open").not.toContain(prefixRid);
     expect(panel.runs).toHaveLength(0);
   });
