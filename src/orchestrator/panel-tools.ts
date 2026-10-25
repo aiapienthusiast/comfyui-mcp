@@ -96,8 +96,13 @@ import { retryConnectAgainstLiveGraph } from "../services/connect-live-graph.js"
 import { verifyPrimitiveForceInputAfterConnect } from "../services/primitive-force-input-connect.js";
 import { rewriteMiniMaxH3DirectorPrimitiveAdvice } from "../services/minimax-h3-director-widget.js";
 import {
-  isDistinctiveDerivedWidgetName,
+  addressMayNameDerivedWidget,
+  isDerivedWidgetName,
+  isKnownDerivedNodeType,
+  knownDerivedWidgetAfterWriteText,
+  knownDerivedWidgetForAddress,
   knownDerivedWidgetRefusalText,
+  resolveDerivedAddressFromRow,
 } from "../services/derived-widget-write.js";
 import { retryRailSlotConnect } from "../services/rail-slot-connect.js";
 import { retryWildcardSlotConnect } from "../services/wildcard-slot-connect.js";
@@ -4717,7 +4722,9 @@ function observedWidgetFromQuery(
   expectedScope?: SetWidgetReadbackScope,
   expectedNodeIdentity?: string,
   rejectDuplicateRows = false,
-): { status: "value"; value: unknown } | { status: "unknown"; reason: string } {
+):
+  | { status: "value"; value: unknown; drivenByLink?: unknown }
+  | { status: "unknown"; reason: string } {
   if (res.isError) return { status: "unknown", reason: "the graph read failed" };
   const payload = parseToolResultJson(res);
   if (!setWidgetReadbackScopeMatches(payload, expectedScope)) {
@@ -4759,7 +4766,14 @@ function observedWidgetFromQuery(
   if (!isReadableWidgetScalar(value)) {
     return { status: "unknown", reason: `the graph read could not show "${widget}" as a scalar` };
   }
-  return { status: "value", value };
+  // #607 — the panel names widgets a link overrides at run time.
+  const driven = row.driven_by_link;
+  const drivenByLink =
+    driven && typeof driven === "object" && !Array.isArray(driven) &&
+    Object.prototype.hasOwnProperty.call(driven, widget)
+      ? (driven as Record<string, unknown>)[widget]
+      : undefined;
+  return { status: "value", value, ...(drivenByLink !== undefined ? { drivenByLink } : {}) };
 }
 
 function setWidgetTimeoutUnknown(
@@ -4896,16 +4910,17 @@ async function settleSetWidgetAfterAckTimeout(
 }
 
 // ---- #2933 / #2918: one fenced read after an acknowledged string write ------
-// The panel verifies `widget.value` inside its own write envelope. A node's
-// frontend code can still put its own state back afterwards — MiniMaxH3Easy's
-// editor sync on serialize, DenoLocalLLMRefiner's setupNode re-applying its
-// load-time widget values — and the reporters' very next panel_query_graph
-// showed the old value under an applied:true receipt. Take ONE graph read on
-// the same tab, connection, graph view and node incarnation as the write and
-// compare it with the value the panel echoed. No sleep and no retry: this sees
-// an overwrite that lands before the read is served, and nothing later, so it
-// is a truthful receipt rather than a durability proof. String values only —
-// numeric snaps (#805) and coerced composites have their own panel semantics.
+// The panel verifies `widget.value` inside its own write envelope; a later
+// change is invisible to that receipt. The reporters' very next
+// panel_query_graph showed the old value under an applied:true reply. Take ONE
+// graph read on the same tab, connection, graph view and node incarnation as
+// the write and compare it with the value the panel echoed. No sleep and no
+// retry: a mismatch proves only that the written value was not observed
+// afterwards — not that the write never applied, not why (node frontend code or
+// another edit), and not what a run would use (a linked input supplies its own
+// value). Node-specific causes and remedies live in the derived-widget refusal
+// table, not here. String values only — numeric snaps (#805) and coerced
+// composites have their own panel semantics.
 
 type SetWidgetPostWriteFence = {
   dispatchTab: string;
@@ -4915,22 +4930,40 @@ type SetWidgetPostWriteFence = {
 };
 
 const POST_WRITE_READBACK_MATCHED =
-  "one graph read on the same tab, connection, graph view and node incarnation, taken right " +
-  "after the acknowledgement, showed the written value. It cannot see a later overwrite by the " +
-  "node's own code; if a run must use this value, panel_query_graph the node again first.";
+  "One graph read on the same tab, connection, graph view and node incarnation, taken right " +
+  "after the acknowledgement, showed the written value. It cannot see a later change; if a run " +
+  "must use this value, panel_query_graph the node again first.";
 
-function setWidgetOverwrittenNote(widget: string, observedPrevious: boolean): string {
+const POST_WRITE_READBACK_UNVERIFIED =
+  "The panel acknowledged this write (its set/applied fields are that acknowledgement); the " +
+  "current value was not verified afterwards. This is not a durability or execution claim.";
+
+const POST_WRITE_LINK_DRIVEN =
+  " This widget's input is linked (driven_by_link): at run time the linked source supplies the " +
+  "value, not the stored widget value.";
+
+function unverifiedReadback(reason: string): Record<string, unknown> {
+  return { status: "unverified", reason, note: POST_WRITE_READBACK_UNVERIFIED };
+}
+
+function setWidgetNotObservedNote(
+  widget: string,
+  observedPrevious: boolean,
+  linkDriven: boolean,
+): string {
   return (
-    `CHECKED FOR YOU: the panel acknowledged the write, but a graph read taken immediately ` +
-    `afterwards on the same tab, graph view and node shows "${widget}" holding ` +
+    `The panel acknowledged this write, but one graph read taken right after it, on the same ` +
+    `tab, graph view and node incarnation, did not show "${widget}" holding the written value ` +
     (observedPrevious
-      ? `its PREVIOUS value again. The node's own frontend code (a custom editor or widget sync) ` +
-        `put its state back over the write, so a run would use the old value. `
-      : `a DIFFERENT value than this call wrote. Node code or a concurrent edit replaced it, so ` +
-        `a run would not use this value. `) +
-    `Re-issuing the same write will not change that. If the node has an input socket for this ` +
-    `widget, drive it by link (a PrimitiveStringMultiline into that socket); otherwise edit it ` +
-    `in the node's own UI. Check the live value with panel_query_graph before panel_run.`
+      ? `(it showed the value the panel reported as previous). `
+      : `(it showed a different value). `) +
+    `That establishes only that the value was not observed afterwards — not that the write ` +
+    `never applied, and not why: the node's frontend code may have synchronized its own state ` +
+    `over it, or another edit (the user or another agent) may have changed it in between. It ` +
+    `does not say what a run would use.` +
+    (linkDriven ? POST_WRITE_LINK_DRIVEN : "") +
+    ` Nothing was retried. Inspect the node with panel_query_graph before deciding whether to ` +
+    `write again.`
   );
 }
 
@@ -4946,13 +4979,19 @@ function ordinaryReadbackScope(plan: OrdinaryWritePlan): SetWidgetReadbackScope 
 
 const POST_WRITE_CONFIRMED_BY = "graph read after write";
 
-function isPostWriteOverwriteResult(res: ToolResult): boolean {
+/** A read-back mismatch receipt: terminal for every automatic recovery path. */
+function isPostWriteMismatchResult(res: ToolResult): boolean {
   if (!res.isError) return false;
   const text = res.content.find((c) => c.type === "text")?.text;
   if (typeof text !== "string") return false;
   try {
     const payload = JSON.parse(text) as Record<string, unknown>;
-    return payload.overwritten === true && payload.confirmed_by === POST_WRITE_CONFIRMED_BY;
+    const readback = payload.post_write_readback as Record<string, unknown> | undefined;
+    return (
+      payload.value_observed_after_write === false &&
+      readback?.status === "mismatch" &&
+      readback.confirmed_by === POST_WRITE_CONFIRMED_BY
+    );
   } catch {
     return false;
   }
@@ -4983,14 +5022,15 @@ async function confirmSetWidgetAfterWrite(
   const record = set as Record<string, unknown>;
   const writtenValue = record.value;
   if (typeof writtenValue !== "string") return written;
+  const unverified = (reason: string): ToolResult =>
+    withPostWriteReadback(written, payload, unverifiedReadback(reason));
   // The panel echoes the REAL widget name after label / NAME[i] resolution (#2143).
   const widget = typeof record.widget === "string" ? record.widget : null;
   const echoedId = canonicalQueriedNodeId(record.node_id);
   const requestedId = canonicalQueriedNodeId(nodeId);
-  if (!widget || !echoedId || !requestedId || echoedId !== requestedId) return written;
-
-  const unverified = (reason: string): ToolResult =>
-    withPostWriteReadback(written, payload, { status: "unverified", reason });
+  if (!widget || !echoedId || !requestedId || echoedId !== requestedId) {
+    return unverified("the panel's receipt did not name the written node and widget");
+  }
   if (record.widget_occurrence !== undefined) {
     return unverified(`several widgets on the node are named "${widget}"`);
   }
@@ -5030,18 +5070,19 @@ async function confirmSetWidgetAfterWrite(
     true,
   );
   if (observed.status === "unknown") return unverified(observed.reason);
+  const linkDriven = observed.drivenByLink !== undefined;
   if (widgetValuesMatch(writtenValue, observed.value)) {
     return withPostWriteReadback(written, payload, {
       status: "matched",
-      note: POST_WRITE_READBACK_MATCHED,
+      ...(linkDriven ? { driven_by_link: observed.drivenByLink } : {}),
+      note: POST_WRITE_READBACK_MATCHED + (linkDriven ? POST_WRITE_LINK_DRIVEN : ""),
     });
   }
   if (widgetValuePossiblyClipped(writtenValue, observed.value)) {
     return unverified("the read-back value was clipped by the panel's size cap");
   }
-  const observedPrevious =
-    Object.prototype.hasOwnProperty.call(record, "previous") &&
-    widgetValuesMatch(record.previous, observed.value);
+  const hasPrevious = Object.prototype.hasOwnProperty.call(record, "previous");
+  const observedPrevious = hasPrevious && widgetValuesMatch(record.previous, observed.value);
   return {
     isError: true,
     content: [
@@ -5049,21 +5090,25 @@ async function confirmSetWidgetAfterWrite(
         type: "text",
         text: JSON.stringify(
           {
-            applied: false,
-            overwritten: true,
             acknowledged: true,
+            value_observed_after_write: false,
             mutation_id: mutationId ?? null,
             requested: {
               node_id: record.node_id,
               widget,
               value: summarizeSetWidgetEchoValue(writtenValue, echoFull),
             },
-            ...(Object.prototype.hasOwnProperty.call(record, "previous")
+            ...(hasPrevious
               ? { previous: summarizeSetWidgetEchoValue(record.previous, echoFull) }
               : {}),
-            observed: summarizeSetWidgetEchoValue(observed.value, echoFull),
-            confirmed_by: POST_WRITE_CONFIRMED_BY,
-            note: setWidgetOverwrittenNote(widget, observedPrevious),
+            post_write_readback: {
+              status: "mismatch",
+              observed: summarizeSetWidgetEchoValue(observed.value, echoFull),
+              observed_equals_previous: observedPrevious,
+              ...(linkDriven ? { driven_by_link: observed.drivenByLink } : {}),
+              confirmed_by: POST_WRITE_CONFIRMED_BY,
+            },
+            note: setWidgetNotObservedNote(widget, observedPrevious, linkDriven),
           },
           null,
           2,
@@ -8164,39 +8209,144 @@ async function refuseAnimaRegionalPromptWrite(
 
 /** #2931 / #2933 — refuse a known frontend-owned widget on a PROVEN node type.
  *  `nodeType` must come from a live witness (ordinary plan, promoted mapping,
- *  terminal witness); a missing type refuses nothing. */
+ *  terminal witness); a missing type refuses nothing. `address` is matched the
+ *  way the panel matches names (`NAME[i]`, dotted base, case-insensitive); display
+ *  labels need {@link refuseKnownDerivedAddress}. `linkedHostRoute` is set only on
+ *  the established promoted host-rail route. */
 function knownDerivedWidgetRefusal(
   nodeType: string | undefined,
-  widget: string,
+  address: string,
+  opts: { linkedHostRoute?: boolean } = {},
 ): ToolResult | null {
   if (!nodeType) return null;
-  const text = knownDerivedWidgetRefusalText(nodeType, widget);
+  const widget = knownDerivedWidgetForAddress(nodeType, address);
+  if (!widget) return null;
+  const text = knownDerivedWidgetRefusalText(nodeType, widget, {
+    address,
+    linkedHostRoute: opts.linkedHostRoute,
+  });
   return text ? fail(text) : null;
 }
 
-/** The direct-probe form of {@link knownDerivedWidgetRefusal}, for a write that
- *  reaches dispatch with no proven type (no ordinary/promoted plan). Probes only
- *  for the pack-specific names (`loras`, `h3_prompt_mentions`); an untyped
- *  `text` / `prompt` write keeps its one hop. An unreadable probe is fail-open,
- *  as for Anima. */
-async function refuseKnownDerivedWidgetWrite(
+function derivedAddressRefusal(nodeType: string, address: string, reason: string): ToolResult {
+  return fail(
+    `panel_set_widget refused "${address}" on ${nodeType}: this node type has frontend-owned ` +
+      `widgets whose writes do not reach execution, and the address could not be resolved to ` +
+      `a canonical widget name before dispatch (${reason}). No graph_set_widget was dispatched. ` +
+      `Address the widget by its exact name as listed by panel_query_graph {fields:"detail"}.`,
+  );
+}
+
+/** One pinpoint detail read of the addressed node, for its type and widget rows. */
+async function readDerivedAddressRow(
   ctx: PanelToolCtx,
   nodeId: unknown,
-  widget: string,
-): Promise<ToolResult | null> {
-  if (!isDistinctiveDerivedWidgetName(widget)) return null;
+): Promise<{ type: string; row: Record<string, unknown> } | { reason: string }> {
   const probe = await ctx.call({
     cmd: "graph_query",
     ids: [nodeId],
-    fields: "compact",
+    fields: "detail",
     limit: 1,
-    max_chars: PROMOTED_IDENTITY_PROBE_MAX_CHARS,
+    max_chars: DYNAMIC_COMBO_PROBE_MAX_CHARS,
   });
-  if (probe.isError) return null;
-  const identity = parseVerifiedQueriedNodeIdentity(parseToolResultJson(probe));
+  if (probe.isError) return { reason: "the node read failed" };
+  const row = widgetRowFromGraphQuery(parseToolResultJson(probe));
+  if (!row) return { reason: "the node read did not return exactly one complete node row" };
+  const identity = parseQueriedNodeIdentityRow(row);
   const requestedId = canonicalQueriedNodeId(nodeId);
-  if (!identity || !requestedId || identity.id !== requestedId) return null;
-  return knownDerivedWidgetRefusal(identity.type, widget);
+  if (!identity || !requestedId || identity.id !== requestedId) {
+    return { reason: "the node read did not name the addressed node" };
+  }
+  return { type: identity.type, row };
+}
+
+function classifyDerivedAddressRow(
+  nodeType: string,
+  address: string,
+  row: Record<string, unknown>,
+): ToolResult | null {
+  const resolved = resolveDerivedAddressFromRow(nodeType, address, row);
+  if (resolved.kind === "safe") return null;
+  if (resolved.kind === "unresolved") return derivedAddressRefusal(nodeType, address, resolved.reason);
+  const text = knownDerivedWidgetRefusalText(nodeType, resolved.widget, { address });
+  return text ? fail(text) : null;
+}
+
+/** Typed form: the node's type is already proven. Ordinary node types pay
+ *  nothing. On a known derived type an address that is not a guarded name by
+ *  spelling is resolved from one detail read (labels included), and refused when
+ *  the read cannot establish its canonical target. */
+async function refuseKnownDerivedAddress(
+  ctx: PanelToolCtx,
+  nodeId: unknown,
+  address: string,
+  nodeType: string | undefined,
+): Promise<ToolResult | null> {
+  if (!nodeType || !isKnownDerivedNodeType(nodeType)) return null;
+  const byName = knownDerivedWidgetRefusal(nodeType, address);
+  if (byName) return byName;
+  const read = await readDerivedAddressRow(ctx, nodeId);
+  if ("reason" in read) return derivedAddressRefusal(nodeType, address, read.reason);
+  if (read.type !== nodeType) {
+    return derivedAddressRefusal(nodeType, address, `the node read named type ${read.type}`);
+  }
+  return classifyDerivedAddressRow(nodeType, address, read.row);
+}
+
+/** What an untyped (no ordinary/promoted plan) write learned before dispatch. */
+type UntypedDerivedCheck =
+  | { kind: "checked" }
+  | { kind: "not-probed" }
+  | { kind: "unavailable"; reason: string };
+
+/** Untyped form, for a write no plan typed: probe once when the address could
+ *  name a guarded widget by spelling (`text`, `prompt`, `text[0]`, …). A probe
+ *  that cannot read the node is not a refusal, but the success must say the
+ *  checks did not run ({@link untypedDerivedAfterWrite}). */
+async function untypedDerivedPreflight(
+  ctx: PanelToolCtx,
+  nodeId: unknown,
+  address: string,
+): Promise<ToolResult | UntypedDerivedCheck> {
+  if (!addressMayNameDerivedWidget(address)) return { kind: "not-probed" };
+  const read = await readDerivedAddressRow(ctx, nodeId);
+  if ("reason" in read) return { kind: "unavailable", reason: read.reason };
+  if (!isKnownDerivedNodeType(read.type)) return { kind: "checked" };
+  return classifyDerivedAddressRow(read.type, address, read.row) ?? { kind: "checked" };
+}
+
+/** After an untyped write the panel acknowledged: disclose checks that could not
+ *  run, and catch a display-label alias the PANEL resolved onto a guarded name
+ *  (only knowable from its echo). Never retries or rolls back. */
+async function untypedDerivedAfterWrite(
+  ctx: PanelToolCtx,
+  written: ToolResult,
+  nodeId: unknown,
+  address: string,
+  pre: UntypedDerivedCheck,
+): Promise<ToolResult> {
+  if (written.isError || pre.kind === "checked") return written;
+  const payload = parseToolResultJson(written);
+  const set = payload?.set;
+  if (!payload || !set || typeof set !== "object" || Array.isArray(set)) return written;
+  const unchecked = (reason: string): ToolResult =>
+    withPostWriteReadback(
+      written,
+      payload,
+      unverifiedReadback(
+        `the node type could not be read (${reason}), so the known frontend-owned widget ` +
+          `checks (LoraManager text/loras, MiniMaxH3Easy prompt) did not run`,
+      ),
+    );
+  if (pre.kind === "unavailable") return unchecked(pre.reason);
+  const echoed = (set as Record<string, unknown>).widget;
+  if (typeof echoed !== "string" || echoed === address || !isDerivedWidgetName(echoed)) {
+    return written;
+  }
+  const read = await readDerivedAddressRow(ctx, nodeId);
+  if ("reason" in read) return unchecked(read.reason);
+  const text = knownDerivedWidgetAfterWriteText(read.type, echoed, address);
+  return text ? fail(text) : written;
 }
 
 /** Run the complete known-bad widget refusal set for the node that will actually
@@ -8206,8 +8356,8 @@ async function refuseKnownDerivedWidgetWrite(
  *
  * `knownNodeType` is the live-proven type of `nodeId` when the caller holds one.
  * The derived-widget table (#2931/#2933) is keyed on it and runs no probe here:
- * `text` / `prompt` are common names, so a caller without a proven type runs
- * {@link refuseKnownDerivedWidgetWrite} once its preflight has shown no plan
+ * a caller resolves label aliases with {@link refuseKnownDerivedAddress} once its
+ * preflight proved the type, or runs {@link untypedDerivedPreflight} when no plan
  * will supply one, and `write()` re-checks every typed dispatch. */
 async function refuseKnownBadWidgetWrite(
   ctx: PanelToolCtx,
@@ -8231,9 +8381,15 @@ async function refuseKnownBadWidgetWrite(
  * published by the receiver. The terminal is not in MCP's current graph after
  * entering the outer container, so this decision uses the panel's authenticated
  * value-free identity/shape witness rather than a second graph_query that could
- * resolve a graph-local id in the wrong scope. */
+ * resolve a graph-local id in the wrong scope.
+ *
+ * `linkedHostRoute` is set only where the write goes to the enclosing host rail
+ * because the inner widget is proven link-driven from it (`innerLinkDriven`). A
+ * MiniMaxH3Easy `prompt` reached that way executes through the link; a direct
+ * inner write, or any LoraManager `text`, stays refused. */
 function refuseKnownBadPromotedTerminal(
   terminal: PromotedTerminalWitness,
+  opts: { linkedHostRoute?: boolean } = {},
 ): ToolResult | null {
   if (ANIMA_REGIONAL_CANVAS_TYPES.has(terminal.nodeType) && isAnimaRegionalPromptWidget(terminal.widget)) {
     return animaRegionalPromptRefusal(terminal.nodeType, terminal.widget);
@@ -8248,7 +8404,7 @@ function refuseKnownBadPromotedTerminal(
     terminal.widget,
   );
   if (dynamic) return dynamic;
-  const derived = knownDerivedWidgetRefusal(terminal.nodeType, terminal.widget);
+  const derived = knownDerivedWidgetRefusal(terminal.nodeType, terminal.widget, opts);
   if (derived) return derived;
   if (terminal.nodeType === DASIWA_LTX2_LORA_LOADER && terminal.widget === DASIWA_STACK_WIDGET) {
     return daSiWaStackRefusal(terminal.nodeType);
@@ -9929,14 +10085,23 @@ async function preparePromotedWidgetWrite(
       "the receiver did not publish a terminal witness for the nested promotion chain",
     );
   }
+  // #2500/#2533 — classified once here and carried on the plan: a link-driven
+  // inner is written ONLY through the enclosing host rail, never directly.
+  const innerLinkDriven =
+    hostProvenString ||
+    promotedInnerWidgetIsLinkDriven(innerNode, inner.widget, inner.terminal, inner.parentRail);
   if (inner.terminal) {
-    const terminalBlocked = refuseKnownBadPromotedTerminal(inner.terminal);
+    const terminalBlocked = refuseKnownBadPromotedTerminal(inner.terminal, {
+      linkedHostRoute: innerLinkDriven,
+    });
     if (terminalBlocked) return terminalBlocked;
   } else {
     // #2931 / #2933 — without a terminal witness the mapped inner node is the
     // concrete endpoint (a nested chain was refused above), and a host-first
     // write reaches it without the inner path's own guard.
-    const derivedBlocked = knownDerivedWidgetRefusal(innerNodeType, inner.widget);
+    const derivedBlocked = knownDerivedWidgetRefusal(innerNodeType, inner.widget, {
+      linkedHostRoute: innerLinkDriven,
+    });
     if (derivedBlocked) return derivedBlocked;
   }
   // A receiver that advertises the identity fence must publish the immediate
@@ -9999,14 +10164,7 @@ async function preparePromotedWidgetWrite(
     ...(outerNodeIdentity ? { outerNodeIdentity } : {}),
     inner,
     innerNodeType,
-    innerLinkDriven:
-      hostProvenString ||
-      promotedInnerWidgetIsLinkDriven(
-        innerNode,
-        inner.widget,
-        inner.terminal,
-        inner.parentRail,
-      ),
+    innerLinkDriven,
     ...(inner.terminal ? { terminal: inner.terminal } : {}),
     scope,
     binding: {
@@ -22280,7 +22438,7 @@ export function buildPanelToolDefs(): PanelToolDef[] {
     ),
     def(
       "panel_set_widget",
-      "Set a widget value on a node in the user's open graph (steps, cfg, seed, ckpt_name, text prompts, …). Returns the previous and new value (a string longer than 1000 chars is echoed as {chars, sha256, preview} so batched calls stay inside the outer tool-result budget — pass `echo: \"full\"` for the verbatim string). Undoable with Ctrl+Z. To CLEAR a text widget to an empty string, pass `clear: true` (some MCP clients drop an empty-string `value` from the serialized payload, so `value: \"\"` may not arrive — `clear: true` always works). For the LTXDirector timeline node (WhatDreamsCost CSGlide), set `timeline_data` with the FULL timeline JSON (segments + global_prompt) to drive its custom timeline UI — this re-syncs the editor and regenerates its derived `local_prompts`/`segment_lengths`/`guide_strength` widgets; setting those derived widgets directly is refused (they are silently reverted). For AnimaRegionalCanvasInline / Krea2RegionalCanvasInline (LC123), quality/scene/red/green/blue/negative prompt writes are refused: the custom textarea and node.properties.animaPrompts overwrite widget.value on APPLY. Drive quality/scene/negative via a PrimitiveStringMultiline wired into quality_prompt_in / scene_prompt_in / negative_prompt_in; red/green/blue have no socket. DaSiWa_LTX2LoraLoader's `stack_data` write is also refused: its custom multi-row widget reserializes its own JS state over `widget.value`, so the echoed write would be a false success; edit the stack rows in the node UI instead. For MiniMaxH3Director, prompt / builder_state / timeline_data writes are refused (they are derived write-backs of the in-memory builderState). Drive the prompt via a backend STRING producer such as PrimitiveStringMultiline wired into external_prompt_overwrite — not a frontend PrimitiveNode; panel_connect refuses that forceInput-only STRING. For MiniMaxH3Easy (and MiniMaxH3EasyContextSegments / MiniMaxH3EasySelectedVideoContext), prompt / h3_prompt_mentions writes are refused: the prompt editor copies its own text back over prompt on serialize and queue. Wire a PrimitiveStringMultiline into the prompt input instead. For ComfyUI-Lora-Manager's Lora Loader / Lora Stacker / WanVideo Lora Select / Create Hook LoRA, text / loras writes are refused: the backend ignores text and applies only the DOM-owned loras list. Use LoRA Text Loader (LoraManager) with a PrimitiveStringMultiline wired into lora_syntax, or edit the rows in the node UI. An ordinary string write on a fenced graph view is read back once right after the acknowledgement: the reply carries post_write_readback {status: matched | unverified, …}, and a write the node's own code immediately put back fails with applied:false, overwritten:true and the observed value — re-issuing it will not help. A match is not a durability guarantee; re-read the node before panel_run when it matters.",
+      "Set a widget value on a node in the user's open graph (steps, cfg, seed, ckpt_name, text prompts, …). Returns the previous and new value (a string longer than 1000 chars is echoed as {chars, sha256, preview} so batched calls stay inside the outer tool-result budget — pass `echo: \"full\"` for the verbatim string). Undoable with Ctrl+Z. To CLEAR a text widget to an empty string, pass `clear: true` (some MCP clients drop an empty-string `value` from the serialized payload, so `value: \"\"` may not arrive — `clear: true` always works). For the LTXDirector timeline node (WhatDreamsCost CSGlide), set `timeline_data` with the FULL timeline JSON (segments + global_prompt) to drive its custom timeline UI — this re-syncs the editor and regenerates its derived `local_prompts`/`segment_lengths`/`guide_strength` widgets; setting those derived widgets directly is refused (they are silently reverted). For AnimaRegionalCanvasInline / Krea2RegionalCanvasInline (LC123), quality/scene/red/green/blue/negative prompt writes are refused: the custom textarea and node.properties.animaPrompts overwrite widget.value on APPLY. Drive quality/scene/negative via a PrimitiveStringMultiline wired into quality_prompt_in / scene_prompt_in / negative_prompt_in; red/green/blue have no socket. DaSiWa_LTX2LoraLoader's `stack_data` write is also refused: its custom multi-row widget reserializes its own JS state over `widget.value`, so the echoed write would be a false success; edit the stack rows in the node UI instead. For MiniMaxH3Director, prompt / builder_state / timeline_data writes are refused (they are derived write-backs of the in-memory builderState). Drive the prompt via a backend STRING producer such as PrimitiveStringMultiline wired into external_prompt_overwrite — not a frontend PrimitiveNode; panel_connect refuses that forceInput-only STRING. For MiniMaxH3Easy (and MiniMaxH3EasyContextSegments / MiniMaxH3EasySelectedVideoContext), prompt / h3_prompt_mentions writes are refused: the prompt editor copies its own text over prompt on serialize and rebuilds an unlinked prompt from the editor at queue time. Wire a PrimitiveStringMultiline into the prompt input instead; a promoted prompt whose inner input is linked from the enclosing subgraph rail is written on that host rail. For ComfyUI-Lora-Manager's Lora Loader / Lora Stacker / WanVideo Lora Select / Create Hook LoRA, text / loras writes are refused (also when addressed by label, NAME[i] or another alias): the backend ignores text and applies only the DOM-owned loras list. Use LoRA Text Loader (LoraManager) with a PrimitiveStringMultiline wired into lora_syntax, or edit the rows in the node UI. An ordinary string write on a fenced graph view is read back once right after the acknowledgement and the reply carries post_write_readback: matched (one read saw the value), unverified (the panel acknowledged; the current value was not verified, with the reason), or — as an error with acknowledged:true, value_observed_after_write:false and the observed value — mismatch. A mismatch says only that the value was not observed afterwards, not why (node code or another edit) and not what a run uses (a linked input supplies its own value); nothing is retried, so inspect the node before writing again. None of these is a durability or execution guarantee; re-read the node before panel_run when it matters.",
       {
         node_id: nodeId().describe("Node id from panel_graph_outline / panel_query_graph."),
         widget: z.string().describe("Widget name (e.g. 'steps', 'cfg', 'text')."),
@@ -22354,14 +22512,26 @@ export function buildPanelToolDefs(): PanelToolDef[] {
           expectedNodeType = daSiWaFence?.expectedNodeType;
         }
         // #2931 / #2933 — the derived-widget table is keyed on the type of the
-        // node this call writes. An ordinary plan proved it; a promoted plan was
-        // checked on its terminal / inner node in preflight. Only a write with
-        // neither probes, and only for the pack-specific names.
+        // node this call writes. An ordinary plan (or the DaSiWa fence) proved it,
+        // and only a known derived type pays a read to resolve label aliases; a
+        // promoted plan was checked on its terminal / inner node in preflight. A
+        // write with no type probes once when its address could name a guarded
+        // widget, and its success discloses checks that could not run.
+        let untypedDerived: UntypedDerivedCheck | null = null;
         if (!promotedPlan) {
-          const derivedBlocked = ordinaryPlan
-            ? knownDerivedWidgetRefusal(ordinaryPlan.expectedNodeType, args.widget as string)
-            : await refuseKnownDerivedWidgetWrite(ctx, args.node_id, args.widget as string);
-          if (derivedBlocked) return derivedBlocked;
+          if (expectedNodeType) {
+            const derivedBlocked = await refuseKnownDerivedAddress(
+              ctx,
+              args.node_id,
+              args.widget as string,
+              expectedNodeType,
+            );
+            if (derivedBlocked) return derivedBlocked;
+          } else {
+            const pre = await untypedDerivedPreflight(ctx, args.node_id, args.widget as string);
+            if ("content" in pre) return pre;
+            untypedDerived = pre;
+          }
         }
         // #599: the frontend runs refresh-before-validate here (pulls a fresh
         // /object_info so a just-staged/-downloaded/-installed value is accepted on
@@ -22576,6 +22746,13 @@ export function buildPanelToolDefs(): PanelToolDef[] {
           );
           if (blocked) return blocked;
           if (ordinaryRetry) {
+            const aliasBlocked = await refuseKnownDerivedAddress(
+              ctx,
+              nodeId,
+              widget,
+              ordinaryRetry.expectedNodeType,
+            );
+            if (aliasBlocked) return aliasBlocked;
             return write(
               nodeId,
               widget,
@@ -22586,11 +22763,25 @@ export function buildPanelToolDefs(): PanelToolDef[] {
               ordinaryReadbackScope(ordinaryRetry),
             );
           }
-          if (!targetExpectedNodeType) {
-            const derivedBlocked = await refuseKnownDerivedWidgetWrite(ctx, nodeId, widget);
-            if (derivedBlocked) return derivedBlocked;
+          if (targetExpectedNodeType) {
+            const aliasBlocked = await refuseKnownDerivedAddress(
+              ctx,
+              nodeId,
+              widget,
+              targetExpectedNodeType,
+            );
+            if (aliasBlocked) return aliasBlocked;
+            return write(nodeId, widget, targetExpectedNodeType);
           }
-          return write(nodeId, widget, targetExpectedNodeType);
+          const pre = await untypedDerivedPreflight(ctx, nodeId, widget);
+          if ("content" in pre) return pre;
+          return untypedDerivedAfterWrite(
+            ctx,
+            await write(nodeId, widget, targetExpectedNodeType),
+            nodeId,
+            widget,
+            pre,
+          );
         };
 
         writePromotedInner = async (plan: PromotedWritePlan): Promise<ToolResult> => {
@@ -22632,7 +22823,11 @@ export function buildPanelToolDefs(): PanelToolDef[] {
             // when the #2488 host-rail write already contradicted.
             if (plan.innerLinkDriven) {
               if (plan.terminal) {
-                const terminalBlocked = refuseKnownBadPromotedTerminal(plan.terminal);
+                // This branch writes only the host rail, the established route
+                // for a link-driven inner, so a linked H3 prompt may take it.
+                const terminalBlocked = refuseKnownBadPromotedTerminal(plan.terminal, {
+                  linkedHostRoute: true,
+                });
                 if (terminalBlocked) return terminalBlocked;
               }
               const hostWidget = plan.hostWidget;
@@ -23049,15 +23244,27 @@ export function buildPanelToolDefs(): PanelToolDef[] {
           expectedNodeIdentity,
           ordinaryPlan ? ordinaryReadbackScope(ordinaryPlan) : undefined,
         );
+        if (untypedDerived && !first.isError) {
+          first = await untypedDerivedAfterWrite(
+            ctx,
+            first,
+            args.node_id,
+            args.widget as string,
+            untypedDerived,
+          );
+          // A post-dispatch finding is a verdict on an acknowledged write, not a
+          // refusal for the recovery paths below to reinterpret.
+          if (first.isError) return first;
+        }
         if (!first.isError) {
           if (parseToolResultJson(first)?.refresh_pending !== true) {
             markPanelSchemaReady(panelSchemaKey(ctx));
           }
           return persistUnpromotedControlAfterGenerate(first, ctx, args.node_id);
         }
-        // An acknowledged write that a read then showed overwritten is a
+        // An acknowledged write whose value a read did not show afterwards is a
         // verdict, not a refusal for the recovery paths below to reinterpret.
-        if (isPostWriteOverwriteResult(first)) return first;
+        if (isPostWriteMismatchResult(first)) return first;
         // #2202 — stale-combo recovery may have retired the panel's last usable
         // whole-schema snapshot before its bounded refresh wait abandoned. The
         // panel refused before writing, so dispatching its idempotent,
@@ -23150,6 +23357,8 @@ export function buildPanelToolDefs(): PanelToolDef[] {
                 `write was retried once. The tab remains in that entered scope.)`,
             );
           }
+          // The retried write was acknowledged; only its read-back disagreed.
+          if (isPostWriteMismatchResult(retried)) return retried;
           return appendToolResultText(
             retried,
             `\n\n(The panel_enter_subgraph route was re-entered, but the exact write ` +
@@ -23187,7 +23396,7 @@ export function buildPanelToolDefs(): PanelToolDef[] {
           if (!retried.isError) {
             return persistUnpromotedControlAfterGenerate(retried, ctx, args.node_id);
           }
-          if (isPostWriteOverwriteResult(retried)) return retried;
+          if (isPostWriteMismatchResult(retried)) return retried;
           if (isObjectInfoBudgetRefusal(retried)) {
             markPanelSchemaBlocked(schemaKey);
             first = appendToolResultText(retried, objectInfoWidgetRefreshNote(refreshed, true));

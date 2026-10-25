@@ -4,14 +4,16 @@
 //     widget values it captured at load, so the next panel_query_graph showed the
 //     old prompt (#2918).
 //   - MiniMaxH3Easy `prompt`: the pack's prompt editor copies its own document back
-//     over the widget on serialize / queue (#2933).
+//     over the widget on serialize and rebuilds an unlinked prompt at queue (#2933).
 //   - Lora Loader (LoraManager) `text`: the write sticks and reads back equal, but
 //     the backend ignores `text` and applies only the DOM-owned `loras` list (#2931).
 //
 // Drives the shipped panel_set_widget through makePanelToolCtx with the live
-// protocol shapes (viewing.graph_identity, node_identity, expected_node_* fences).
-// The mock panel applies a write on receive; a "frontend overwrite" is modelled as
-// node code that runs on a later macrotask, exactly the window between the panel's
+// protocol shapes (viewing.graph_identity, node_identity, widget_labels,
+// driven_by_link, expected_node_* fences). The mock panel resolves widget
+// addresses the way the panel does (exact, NAME[i], dotted, case-insensitive,
+// display label) and applies a write on receive; a later change is modelled as
+// code that runs on a later macrotask — the window between the panel's
 // in-envelope verification and the next command it serves.
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
@@ -35,14 +37,19 @@ const NODE_IDENTITY = "node:2:original";
 const MUTATION_RID = "rid-set-widget-2933";
 const OLD_PROMPT = "The girl in <Picture 1> is staying mostly still and periodically blinks.";
 const NEW_PROMPT = "The girl in <Picture 1> is standing still and breathing deeply and slowly.";
+const LORA_LOADER = "Lora Loader (LoraManager)";
 
 type Sent = { cmd: string; payload: Record<string, unknown> };
 
 type Harness = {
   nodeType?: string;
   widgets?: Record<string, unknown>;
-  /** Node code that runs on a later macrotask after a write lands. */
-  overwriteAfterWrite?: (live: Record<string, unknown>) => void;
+  /** Renamed widgets: name -> display label (the panel's `widget_labels`). */
+  labels?: Record<string, string>;
+  /** Widgets a link overrides at run time (the panel's `driven_by_link`). */
+  drivenByLink?: Record<string, unknown>;
+  /** Code that runs on a later macrotask after a write lands. */
+  afterWrite?: (live: Record<string, unknown>) => void;
   /** Override what the post-write graph read reports. */
   readback?: {
     graphIdentity?: string;
@@ -51,11 +58,15 @@ type Harness = {
     error?: boolean;
     duplicate?: boolean;
     reconnectDuring?: boolean;
+    /** Replace the whole reply with a malformed shape. */
+    raw?: unknown;
   };
   /** Omit the receiver's per-object node incarnation (older panel). */
   noNodeIdentity?: boolean;
   /** A forwarding-only context with no capability API (no ordinary plan). */
   legacy?: boolean;
+  /** Every node read fails (identity unavailable). */
+  readsFail?: boolean;
   setReplyExtras?: Record<string, unknown>;
 };
 
@@ -67,8 +78,26 @@ const textOf = (res: ToolResult): string =>
 
 const cmds = (): string[] => sent.map((s) => s.cmd);
 
+/** The panel's resolveWidgetAddress order, reduced to what these tests use. */
+function resolveAddress(
+  address: string,
+  live: Record<string, unknown>,
+  labels: Record<string, string>,
+): string {
+  if (address in live) return address;
+  const selector = address.match(/^(.+)\[(\d+)\]$/);
+  if (selector && selector[1] in live) return selector[1];
+  const dot = address.indexOf(".");
+  if (dot > 0 && address.slice(0, dot) in live) return address;
+  const ci = Object.keys(live).find((name) => name.toLowerCase() === address.toLowerCase());
+  if (ci) return ci;
+  const labelled = Object.entries(labels).find(([, label]) => label === address);
+  return labelled ? labelled[0] : address;
+}
+
 function makeBridge(h: Harness): PanelToolCtx["bridge"] {
   const live: Record<string, unknown> = { ...(h.widgets ?? { text: OLD_PROMPT }) };
+  const labels = h.labels ?? {};
   const nodeType = h.nodeType ?? "CLIPTextEncode";
   let wrote = false;
   let generation = 1;
@@ -85,6 +114,8 @@ function makeBridge(h: Harness): PanelToolCtx["bridge"] {
     is_subgraph: false,
     ...(h.noNodeIdentity ? {} : { node_identity: nodeIdentity }),
     widgets,
+    ...(Object.keys(labels).length ? { widget_labels: labels } : {}),
+    ...(h.drivenByLink ? { driven_by_link: h.drivenByLink } : {}),
     inputs: [],
   });
 
@@ -98,22 +129,24 @@ function makeBridge(h: Harness): PanelToolCtx["bridge"] {
         o?.beforeDispatch?.();
         o?.onDispatchedRid?.(MUTATION_RID);
         dispatchedWrites += 1;
-        const widget = String(cmd.widget);
+        const widget = resolveAddress(String(cmd.widget), live, labels);
         const previous = live[widget];
         live[widget] = cmd.value;
         wrote = true;
-        if (h.overwriteAfterWrite) setTimeout(() => h.overwriteAfterWrite!(live), 0);
+        if (h.afterWrite) setTimeout(() => h.afterWrite!(live), 0);
         return {
           set: { node_id: cmd.node_id, widget, previous, value: cmd.value },
           ...(h.setReplyExtras ?? {}),
         };
       }
       if (cmd.cmd === "graph_query") {
+        if (h.readsFail) throw new Error("graph_query failed: tab busy");
+        // Let code scheduled by the write run first, as it would on the page.
+        if (wrote) await new Promise((resolve) => setTimeout(resolve, 5));
         if (wrote && h.readback) {
-          // Let node code scheduled by the write run first, as it would on the page.
-          await new Promise((resolve) => setTimeout(resolve, 5));
           if (h.readback.reconnectDuring) generation = 2;
           if (h.readback.error) throw new Error("graph_query failed: tab busy");
+          if ("raw" in h.readback) return h.readback.raw;
           const widgets = {
             ...live,
             ...("value" in h.readback ? { [Object.keys(live)[0]!]: h.readback.value } : {}),
@@ -132,7 +165,6 @@ function makeBridge(h: Harness): PanelToolCtx["bridge"] {
             node_count: 1,
           };
         }
-        if (wrote) await new Promise((resolve) => setTimeout(resolve, 5));
         return { viewing: viewing(), truncated: false, nodes: [row({ ...live })], node_count: 1 };
       }
       if (cmd.cmd === "graph_get_subgraph") {
@@ -185,6 +217,9 @@ async function setWidget(h: Harness, args: Record<string, unknown>) {
   return { res, text, json, isError: res.isError === true };
 }
 
+const readbackOf = (json: Record<string, unknown> | null) =>
+  (json?.post_write_readback ?? {}) as Record<string, unknown>;
+
 beforeEach(() => {
   sent = [];
   dispatchedWrites = 0;
@@ -192,7 +227,7 @@ beforeEach(() => {
 
 describe("known frontend-owned widgets are refused before dispatch (#2931, #2933)", () => {
   it.each([
-    "Lora Loader (LoraManager)",
+    LORA_LOADER,
     "Lora Stacker (LoraManager)",
     "WanVideo Lora Select (LoraManager)",
     "Create Hook LoRA (LoraManager)",
@@ -213,12 +248,12 @@ describe("known frontend-owned widgets are refused before dispatch (#2931, #2933
 
   it("names the pack's text-driven loader and a backend STRING producer for Lora Loader", async () => {
     const out = await setWidget(
-      { nodeType: "Lora Loader (LoraManager)", widgets: { text: "", loras: [] } },
+      { nodeType: LORA_LOADER, widgets: { text: "", loras: [] } },
       { node_id: NODE_ID, widget: "loras", value: "[]" },
     );
 
     expect(out.isError).toBe(true);
-    expect(out.text).toContain(`cannot set "loras" on Lora Loader (LoraManager)`);
+    expect(out.text).toContain(`cannot set "loras" on ${LORA_LOADER}`);
     expect(out.text).toContain(`Use "LoRA Text Loader (LoraManager)" instead`);
     expect(out.text).toMatch(/PrimitiveStringMultiline, set its STRING widget, then panel_connect that STRING output to "lora_syntax"/);
     expect(dispatchedWrites).toBe(0);
@@ -255,10 +290,8 @@ describe("known frontend-owned widgets are refused before dispatch (#2931, #2933
   it.each([
     ["CLIPTextEncode", "text"],
     ["PrimitiveStringMultiline", "value"],
-    ["MiniMaxH3Easy", "seed"],
-    ["Lora Loader (LoraManager)", "strength_model"],
     ["SomeOtherNode", "prompt"],
-  ])("keeps the plain setter path for %s.%s", async (nodeType, widget) => {
+  ])("keeps the plain setter path, with no extra probe, for %s.%s", async (nodeType, widget) => {
     const out = await setWidget(
       { nodeType, widgets: { [widget]: "old" } },
       { node_id: NODE_ID, widget, value: "new" },
@@ -266,47 +299,204 @@ describe("known frontend-owned widgets are refused before dispatch (#2931, #2933
 
     expect(out.isError).toBe(false);
     expect(out.json?.set).toMatchObject({ node_id: NODE_ID, widget, value: "new" });
+    // preflight scope read, the write, and the post-write read-back — nothing else.
+    expect(cmds()).toEqual(["graph_query", "graph_set_widget", "graph_query"]);
     expect(dispatchedWrites).toBe(1);
   });
 
-  it("fences the refusal on the PROVEN type: no extra probe on the ordinary path", async () => {
+  it.each([
+    ["MiniMaxH3Easy", "seed"],
+    [LORA_LOADER, "strength_model"],
+  ])("keeps an unrelated widget writable on the affected type %s (%s)", async (nodeType, widget) => {
+    const out = await setWidget(
+      { nodeType, widgets: { [widget]: "old", text: "", prompt: "" } },
+      { node_id: NODE_ID, widget, value: "new" },
+    );
+
+    expect(out.isError).toBe(false);
+    expect(dispatchedWrites).toBe(1);
+  });
+
+  it("fences the refusal on the PROVEN type: no extra probe for a guarded name", async () => {
     await setWidget(
       { nodeType: "MiniMaxH3Easy", widgets: { prompt: OLD_PROMPT } },
       { node_id: NODE_ID, widget: "prompt", value: NEW_PROMPT },
     );
-    // One preflight scope read; the refusal reuses its type.
     expect(cmds()).toEqual(["graph_query"]);
   });
+});
 
-  it("probes an untyped (legacy) write only for the pack-specific names", async () => {
-    const loras = await setWidget(
-      { legacy: true, nodeType: "Lora Loader (LoraManager)", widgets: { loras: [] } },
-      { node_id: NODE_ID, widget: "loras", value: "[]" },
+describe("aliases cannot walk past the refusal (#2931 review P1)", () => {
+  it.each([
+    ["text[0]", ["graph_query"]],
+    ["TEXT", ["graph_query"]],
+    ["Text", ["graph_query"]],
+    // A dotted address also takes the existing dynamic-combo detail probe (#2299).
+    ["text.anything", ["graph_query", "graph_query"]],
+  ])(
+    "refuses the name alias %s on a typed LoraManager node without a label read",
+    async (address, expectedCmds) => {
+      const out = await setWidget(
+        { nodeType: LORA_LOADER, widgets: { text: "", loras: [] } },
+        { node_id: NODE_ID, widget: address, value: "<lora:a:1>" },
+      );
+
+      expect(out.isError).toBe(true);
+      expect(out.text).toContain(`cannot set "text" (addressed as "${address}") on ${LORA_LOADER}`);
+      expect(cmds()).toEqual(expectedCmds);
+      expect(dispatchedWrites).toBe(0);
+    },
+  );
+
+  it("resolves a display label onto `text` from one detail read and refuses it", async () => {
+    const out = await setWidget(
+      {
+        nodeType: LORA_LOADER,
+        widgets: { text: "", loras: [], strength_model: 1 },
+        labels: { text: "LoRA syntax" },
+      },
+      { node_id: NODE_ID, widget: "LoRA syntax", value: "<lora:a:1>" },
     );
-    expect(loras.isError).toBe(true);
-    expect(loras.text).toContain(`cannot set "loras" on Lora Loader (LoraManager)`);
-    expect(dispatchedWrites).toBe(0);
 
-    sent = [];
-    // Documented limit: an untyped `text` write keeps its one hop rather than
-    // probing every CLIPTextEncode write on a context that proves no type.
-    const text = await setWidget(
-      { legacy: true, nodeType: "Lora Loader (LoraManager)", widgets: { text: "" } },
+    expect(out.isError).toBe(true);
+    expect(out.text).toContain(`cannot set "text" (addressed as "LoRA syntax") on ${LORA_LOADER}`);
+    expect(cmds()).toEqual(["graph_query", "graph_query"]);
+    expect(sent[1]?.payload).toMatchObject({ fields: "detail", ids: [NODE_ID] });
+    expect(dispatchedWrites).toBe(0);
+  });
+
+  it("resolves an H3 Easy prompt label and refuses it", async () => {
+    const out = await setWidget(
+      { nodeType: "MiniMaxH3Easy", widgets: { prompt: OLD_PROMPT }, labels: { prompt: "Shot" } },
+      { node_id: NODE_ID, widget: "Shot", value: NEW_PROMPT },
+    );
+
+    expect(out.isError).toBe(true);
+    expect(out.text).toContain(`cannot set "prompt" (addressed as "Shot") on MiniMaxH3Easy`);
+    expect(dispatchedWrites).toBe(0);
+  });
+
+  it("refuses an address on an affected type whose target cannot be read", async () => {
+    // The preflight read succeeds; every later read fails.
+    let reads = 0;
+    const harness: Harness = { nodeType: LORA_LOADER, widgets: { text: "", loras: [] } };
+    const bridge = makeBridge(harness);
+    const send = bridge.send.bind(bridge);
+    (bridge as { send: typeof send }).send = async (cmd, o) => {
+      if (cmd.cmd === "graph_query" && ++reads > 1) {
+        sent.push({ cmd: "graph_query", payload: cmd });
+        throw new Error("graph_query failed");
+      }
+      return send(cmd, o);
+    };
+    const ctx = makePanelToolCtx(bridge, TAB, new WorkflowTargetStore());
+    const def = buildPanelToolDefs().find((d) => d.name === "panel_set_widget")!;
+    const res = await def.handler(
+      { node_id: NODE_ID, widget: "Some Label", value: "x" } as never,
+      ctx,
+    );
+
+    expect(res.isError).toBe(true);
+    expect(textOf(res)).toMatch(/could not be resolved to a canonical widget name before dispatch/);
+    expect(textOf(res)).toMatch(/No graph_set_widget was dispatched/);
+    expect(dispatchedWrites).toBe(0);
+  });
+
+  it("refuses a label two widgets carry on an affected type", async () => {
+    const out = await setWidget(
+      {
+        nodeType: LORA_LOADER,
+        widgets: { text: "", strength_model: 1 },
+        labels: { text: "dup", strength_model: "dup" },
+      },
+      { node_id: NODE_ID, widget: "dup", value: "x" },
+    );
+
+    expect(out.isError).toBe(true);
+    expect(out.text).toMatch(/more than one widget is labelled "dup"/);
+    expect(dispatchedWrites).toBe(0);
+  });
+});
+
+describe("untyped (legacy) writes probe guarded names and disclose what they could not check", () => {
+  it("refuses legacy LoraManager `text` after one identity probe", async () => {
+    const out = await setWidget(
+      { legacy: true, nodeType: LORA_LOADER, widgets: { text: "", loras: [] } },
       { node_id: NODE_ID, widget: "text", value: "<lora:a:1>" },
     );
-    expect(text.isError).toBe(false);
-    expect(cmds().filter((c) => c === "graph_set_widget")).toHaveLength(1);
+
+    expect(out.isError).toBe(true);
+    expect(out.text).toContain(`cannot set "text" on ${LORA_LOADER}`);
+    expect(cmds()).toEqual(["graph_query"]);
+    expect(dispatchedWrites).toBe(0);
+  });
+
+  it("refuses legacy MiniMaxH3Easy `prompt` and its index alias", async () => {
+    for (const address of ["prompt", "prompt[0]"]) {
+      sent = [];
+      const out = await setWidget(
+        { legacy: true, nodeType: "MiniMaxH3Easy", widgets: { prompt: OLD_PROMPT } },
+        { node_id: NODE_ID, widget: address, value: NEW_PROMPT },
+      );
+      expect(out.isError).toBe(true);
+      expect(out.text).toContain(`cannot set "prompt"`);
+    }
+    expect(dispatchedWrites).toBe(0);
+  });
+
+  it("keeps a legacy CLIPTextEncode `text` write after its probe, with no disclosure", async () => {
+    const out = await setWidget(
+      { legacy: true, widgets: { text: "old" } },
+      { node_id: NODE_ID, widget: "text", value: "new" },
+    );
+
+    expect(out.isError).toBe(false);
+    expect(cmds()).toEqual(["graph_query", "graph_set_widget"]);
+    expect(out.json?.post_write_readback).toBeUndefined();
+  });
+
+  it("discloses that the checks did not run when the node cannot be read", async () => {
+    const out = await setWidget(
+      { legacy: true, readsFail: true, widgets: { text: "old" } },
+      { node_id: NODE_ID, widget: "text", value: "new" },
+    );
+
+    expect(out.isError).toBe(false);
+    expect(out.json?.set).toMatchObject({ value: "new" });
+    const readback = readbackOf(out.json);
+    expect(readback.status).toBe("unverified");
+    expect(String(readback.reason)).toMatch(/node type could not be read/);
+    expect(String(readback.note)).toMatch(/panel acknowledged this write/);
+    expect(String(readback.note)).toMatch(/not a durability or execution claim/);
+  });
+
+  it("catches a label the panel resolved onto LoraManager `text`, without replaying it", async () => {
+    const out = await setWidget(
+      {
+        legacy: true,
+        nodeType: LORA_LOADER,
+        widgets: { text: "", loras: [] },
+        labels: { text: "LoRA syntax" },
+      },
+      { node_id: NODE_ID, widget: "LoRA syntax", value: "<lora:a:1>" },
+    );
+
+    expect(out.isError).toBe(true);
+    expect(out.text).toMatch(/acknowledged by the panel as "text" on Lora Loader \(LoraManager\)/);
+    expect(out.text).toMatch(/not retried or rolled back/);
+    // No probe before (the label could not be known), one read after, no replay.
+    expect(cmds()).toEqual(["graph_set_widget", "graph_query"]);
+    expect(dispatchedWrites).toBe(1);
   });
 });
 
 describe("one fenced read after an acknowledged string write (#2918, #2933)", () => {
-  it("#2918: reports applied:false when node code puts the previous value back, without replaying", async () => {
+  it("#2918: a value not observed afterwards is reported as such, without replaying", async () => {
     const out = await setWidget(
       {
         nodeType: "DenoLocalLLMRefiner",
         widgets: { system_prompt: "OLD planner prompt" },
-        // setupNode() re-applies the values captured at load.
-        overwriteAfterWrite: (live) => {
+        afterWrite: (live) => {
           live.system_prompt = "OLD planner prompt";
         },
       },
@@ -315,18 +505,26 @@ describe("one fenced read after an acknowledged string write (#2918, #2933)", ()
 
     expect(out.isError).toBe(true);
     expect(out.json).toMatchObject({
-      applied: false,
-      overwritten: true,
       acknowledged: true,
+      value_observed_after_write: false,
       mutation_id: MUTATION_RID,
       requested: { node_id: NODE_ID, widget: "system_prompt", value: "NEW planner prompt" },
       previous: "OLD planner prompt",
-      observed: "OLD planner prompt",
-      confirmed_by: "graph read after write",
+      post_write_readback: {
+        status: "mismatch",
+        observed: "OLD planner prompt",
+        observed_equals_previous: true,
+        confirmed_by: "graph read after write",
+      },
     });
-    expect(String(out.json?.note)).toMatch(/PREVIOUS value again/);
-    expect(String(out.json?.note)).toMatch(/Re-issuing the same write will not change that/);
-    expect(String(out.json?.note)).toMatch(/PrimitiveStringMultiline/);
+    expect(out.json).not.toHaveProperty("applied");
+    const note = String(out.json?.note);
+    expect(note).toMatch(/value the panel reported as previous/);
+    expect(note).toMatch(/not that the write never applied, and not why/);
+    expect(note).toMatch(/another edit \(the user or another agent\)/);
+    expect(note).toMatch(/does not say what a run would use/);
+    expect(note).toMatch(/Nothing was retried\. Inspect the node/);
+    expect(note).not.toMatch(/will not (help|change)/);
     expect(cmds()).toEqual(["graph_query", "graph_set_widget", "graph_query"]);
     expect(dispatchedWrites).toBe(1);
     expect(sent[2]?.payload).toMatchObject({
@@ -337,20 +535,61 @@ describe("one fenced read after an acknowledged string write (#2918, #2933)", ()
     });
   });
 
-  it("names a DIFFERENT observed value as such", async () => {
+  it("a concurrent edit restoring the previous value gets the same neutral receipt", async () => {
+    // Another agent (or the user) puts "old" back between the ack and the read.
+    const out = await setWidget(
+      { widgets: { text: "old" }, afterWrite: (live) => void (live.text = "old") },
+      { node_id: NODE_ID, widget: "text", value: "new" },
+    );
+
+    expect(out.isError).toBe(true);
+    expect(readbackOf(out.json)).toMatchObject({ status: "mismatch", observed_equals_previous: true });
+    expect(String(out.json?.note)).not.toMatch(/node's own frontend code .* put its state back/);
+    expect(dispatchedWrites).toBe(1);
+  });
+
+  it("a concurrent edit to a third value is named as a different value", async () => {
+    const out = await setWidget(
+      { widgets: { text: "old" }, afterWrite: (live) => void (live.text = "someone else's text") },
+      { node_id: NODE_ID, widget: "text", value: "new" },
+    );
+
+    expect(out.isError).toBe(true);
+    expect(readbackOf(out.json)).toMatchObject({
+      status: "mismatch",
+      observed: "someone else's text",
+      observed_equals_previous: false,
+    });
+    expect(String(out.json?.note)).toMatch(/it showed a different value/);
+  });
+
+  it("a link-driven widget's mismatch says the link supplies the run value", async () => {
     const out = await setWidget(
       {
         widgets: { text: "old" },
-        overwriteAfterWrite: (live) => {
-          live.text = "something else entirely";
-        },
+        drivenByLink: { text: { node_id: 9, output_slot: 0 } },
+        afterWrite: (live) => void (live.text = "old"),
       },
       { node_id: NODE_ID, widget: "text", value: "new" },
     );
 
     expect(out.isError).toBe(true);
-    expect(out.json).toMatchObject({ applied: false, observed: "something else entirely" });
-    expect(String(out.json?.note)).toMatch(/a DIFFERENT value than this call wrote/);
+    expect(readbackOf(out.json)).toMatchObject({
+      status: "mismatch",
+      driven_by_link: { node_id: 9, output_slot: 0 },
+    });
+    expect(String(out.json?.note)).toMatch(/linked source supplies the value/);
+  });
+
+  it("a link-driven widget's match still says the stored value is not what runs", async () => {
+    const out = await setWidget(
+      { widgets: { text: "old" }, drivenByLink: { text: { node_id: 9, output_slot: 0 } } },
+      { node_id: NODE_ID, widget: "text", value: "new" },
+    );
+
+    expect(out.isError).toBe(false);
+    expect(readbackOf(out.json)).toMatchObject({ status: "matched", driven_by_link: { node_id: 9 } });
+    expect(String(readbackOf(out.json).note)).toMatch(/linked source supplies the value/);
   });
 
   it("marks a write the read shows held as matched, and says what that does not prove", async () => {
@@ -364,17 +603,36 @@ describe("one fenced read after an acknowledged string write (#2918, #2933)", ()
       set: { node_id: NODE_ID, widget: "text", previous: "old", value: "new" },
       post_write_readback: { status: "matched" },
     });
-    expect(String((out.json?.post_write_readback as Record<string, unknown>).note)).toMatch(
-      /cannot see a later overwrite/,
-    );
+    expect(String(readbackOf(out.json).note)).toMatch(/cannot see a later change/);
     expect(cmds()).toEqual(["graph_query", "graph_set_widget", "graph_query"]);
   });
 
-  it("does not wait for, or claim to see, an overwrite that lands after the read", async () => {
+  it("clear:true writes \"\" and is read back like any string", async () => {
+    const held = await setWidget(
+      { widgets: { text: "old" } },
+      { node_id: NODE_ID, widget: "text", clear: true },
+    );
+    expect(held.isError).toBe(false);
+    expect(held.json?.set).toMatchObject({ value: "" });
+    expect(readbackOf(held.json).status).toBe("matched");
+
+    sent = [];
+    const restored = await setWidget(
+      { widgets: { text: "old" }, afterWrite: (live) => void (live.text = "old") },
+      { node_id: NODE_ID, widget: "text", clear: true },
+    );
+    expect(restored.isError).toBe(true);
+    expect(restored.json).toMatchObject({
+      requested: { value: "" },
+      post_write_readback: { status: "mismatch", observed: "old" },
+    });
+  });
+
+  it("does not wait for, or claim to see, a change that lands after the read", async () => {
     const out = await setWidget(
       {
         widgets: { text: "old" },
-        overwriteAfterWrite: (live) => {
+        afterWrite: (live) => {
           setTimeout(() => {
             live.text = "old";
           }, 50);
@@ -384,7 +642,7 @@ describe("one fenced read after an acknowledged string write (#2918, #2933)", ()
     );
 
     expect(out.isError).toBe(false);
-    expect((out.json?.post_write_readback as Record<string, unknown>).status).toBe("matched");
+    expect(readbackOf(out.json).status).toBe("matched");
   });
 
   it.each([
@@ -393,17 +651,36 @@ describe("one fenced read after an acknowledged string write (#2918, #2933)", ()
     ["the node id is a new incarnation", { nodeIdentity: "node:2:replacement" }, /different node incarnation/],
     ["the connection changed during the read", { reconnectDuring: true }, /connection changed during the read-back/],
     ["several widgets share the name", { duplicate: true }, /several widgets on the node are named/],
-  ] as const)("keeps the success but marks it unverified when %s", async (_label, readback, reason) => {
+    ["the reply is not JSON", { raw: "#2 CLIPTextEncode · text=old" }, /same graph view/],
+    ["the reply names no node", { raw: { viewing: { scope: "root", graph_identity: GRAPH_ID, workflow_uuid: WORKFLOW_UUID }, nodes: [] } }, /exactly one complete node row/],
+    ["the reply was truncated", { raw: { viewing: { scope: "root", graph_identity: GRAPH_ID, workflow_uuid: WORKFLOW_UUID }, truncated: true, nodes: [] } }, /exactly one complete node row/],
+    [
+      "the row omits the widget",
+      { raw: { viewing: { scope: "root", graph_identity: GRAPH_ID, workflow_uuid: WORKFLOW_UUID }, nodes: [{ id: NODE_ID, type: "CLIPTextEncode", node_identity: NODE_IDENTITY, widgets: {} }] } },
+      /did not list "text"/,
+    ],
+    [
+      "the value is a non-scalar",
+      { raw: { viewing: { scope: "root", graph_identity: GRAPH_ID, workflow_uuid: WORKFLOW_UUID }, nodes: [{ id: NODE_ID, type: "CLIPTextEncode", node_identity: NODE_IDENTITY, widgets: { text: { a: 1 } } }] } },
+      /as a scalar/,
+    ],
+    [
+      "the value is the panel's [binary] placeholder",
+      { raw: { viewing: { scope: "root", graph_identity: GRAPH_ID, workflow_uuid: WORKFLOW_UUID }, nodes: [{ id: NODE_ID, type: "CLIPTextEncode", node_identity: NODE_IDENTITY, widgets: { text: "[binary]" } }] } },
+      /as a scalar/,
+    ],
+  ] as const)("keeps the acknowledgement but marks it unverified when %s", async (_label, readback, reason) => {
     const out = await setWidget(
-      { widgets: { text: "old" }, readback: { ...readback, value: "old" } },
+      { widgets: { text: "old" }, readback: { value: "old", ...readback } },
       { node_id: NODE_ID, widget: "text", value: "new" },
     );
 
     expect(out.isError).toBe(false);
     expect(out.json?.set).toMatchObject({ value: "new" });
-    const readbackField = out.json?.post_write_readback as Record<string, unknown>;
+    const readbackField = readbackOf(out.json);
     expect(readbackField.status).toBe("unverified");
     expect(String(readbackField.reason)).toMatch(reason);
+    expect(String(readbackField.note)).toMatch(/panel acknowledged this write .* current value was not verified/);
     expect(dispatchedWrites).toBe(1);
   });
 
@@ -418,7 +695,7 @@ describe("one fenced read after an acknowledged string write (#2918, #2933)", ()
     expect(cmds().filter((c) => c === "graph_query")).toHaveLength(1);
   });
 
-  it("treats a value clipped by the panel's cap as unverified, not as a revert", async () => {
+  it("treats a value clipped by the panel's cap as unverified, not as a mismatch", async () => {
     const long = `clip-${"x".repeat(2200)}`;
     const out = await setWidget(
       {
@@ -439,11 +716,11 @@ describe("one fenced read after an acknowledged string write (#2918, #2933)", ()
     expect(sent[2]?.payload.widget_max_chars).toBeGreaterThanOrEqual(long.length);
   });
 
-  it("summarizes long values in an overwrite verdict unless echo:full", async () => {
+  it("summarizes long values in a mismatch receipt unless echo:full", async () => {
     const long = `prompt-${"y".repeat(1500)}`;
     const harness: Harness = {
       widgets: { text: OLD_PROMPT },
-      overwriteAfterWrite: (live) => {
+      afterWrite: (live) => {
         live.text = OLD_PROMPT;
       },
     };
