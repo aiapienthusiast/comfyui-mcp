@@ -2118,6 +2118,37 @@ export type UncertainTarget = {
 };
 
 /**
+ * #2955 — does this panel reply leave the mutation's OWN outcome unknown?
+ *
+ * The one classification every settlement path uses (an ordinary reply, a late
+ * reply to a kept receipt, a late reply to an evicted marker). A reply settles a
+ * mutation only when it is definite:
+ *  - a refusal (`ok:false`) is definite — the panel finished with this rid —
+ *    unless it explicitly says otherwise;
+ *  - `applied:true` / `applied:false` / no `applied` at all is definite;
+ *  - an explicit `applied` of any OTHER value (the panel's `applied:"unknown"`)
+ *    or `queued_unknown:true`, at the message or result level, is NOT: the
+ *    command may have applied or may still apply.
+ * A deferral (`deferred:true`) is a definite "not applied now"; its later
+ * replay has no settle signal and stays a disclosed limit.
+ */
+export function replyLeavesOutcomeUnknown(msg: { ok?: unknown; result?: unknown }): boolean {
+  const unresolved = (v: unknown): boolean => {
+    if (!v || typeof v !== "object" || Array.isArray(v)) return false;
+    const body = v as Record<string, unknown>;
+    if (
+      Object.prototype.hasOwnProperty.call(body, "applied") &&
+      body.applied !== true &&
+      body.applied !== false
+    ) {
+      return true;
+    }
+    return body.queued_unknown === true;
+  };
+  return unresolved(msg) || unresolved(msg.result);
+}
+
+/**
  * #2955 — the EXACT command a frame carried: every argument, including the
  * trusted workflow stamp the bridge wrote, in a key-order-independent form.
  * Only the bridge-owned correlation fields (`rid`, `retry_of`, `timeout_ms`)
@@ -4932,9 +4963,12 @@ export class UiBridge {
    */
   private recordLateMutation(rid: string, msg: { ok?: unknown; result?: unknown }): void {
     const started = this.deliveredMutations.get(rid);
+    // #2955 — an explicitly unresolved late answer is not an outcome: keep the
+    // receipt (or the evicted marker) exactly as it is.
+    if (replyLeavesOutcomeUnknown(msg)) return;
     if (!started) {
       // #2955 — the receipt itself was evicted while its outcome was unknown; a
-      // late reply (either verdict) is still that rid's definite outcome.
+      // definite late reply (either verdict) is still that rid's own outcome.
       this.resolveEvictedRid(rid);
       return;
     }
@@ -5197,8 +5231,8 @@ export class UiBridge {
    * #2955 — settle outcome-unknown receipt `rid` from its retry `retryRid`, ONLY
    * when the retry provably re-issued the same command to the same receiver:
    *  - `rid` is still a full receipt here (an evicted marker kept no frame, so
-   *    nothing can prove identity for it — it stays uncertain until its own late
-   *    reply or tab retirement);
+   *    nothing can prove identity for it — it stays uncertain until its own
+   *    definite late reply);
    *  - the retry's own receipt was answered ok under its OWN rid (a terminal
    *    reply is checked by the caller; a #2559 FIFO-matched ack does not count);
    *  - both were written to the same canonical tab and the same connection
@@ -5854,7 +5888,15 @@ export class UiBridge {
     clearTimeout(pending.timer);
     this.pending.delete(rid);
     this.askRidToId.delete(rid);
-    this.forgetDeliveredMutation(rid, msg.ok === true && msg.rid === rid);
+    // #2955 — completing the WAITER is not proof the mutation settled. Only a
+    // reply under this rid's OWN id with a definite outcome settles its receipt.
+    // A #2559 FIFO-borrowed ack (another rid's reply handed to this waiter so the
+    // call is not stranded) and an explicitly unresolved answer leave the receipt
+    // in place — outcome unknown, nothing awaiting it — until its own definite
+    // outcome arrives (recordLateMutation) or it is reconciled exactly.
+    if (msg.rid === rid && !replyLeavesOutcomeUnknown(msg)) {
+      this.forgetDeliveredMutation(rid, msg.ok === true);
+    }
     if (msg.ok) {
       // #422 — the panel DEMONSTRABLY served this command. Record it on the LIVE
       // connection (following a same-socket tmp:→wf: migration whose reply landed
@@ -7372,13 +7414,13 @@ export class UiBridge {
     });
   }
 
-  /** `answeredOk`: the panel replied ok under THIS rid (not a #2559 FIFO match). */
+  /** `answeredOk`: the panel replied ok, definitely, under THIS rid (never a #2559 FIFO match). */
   private forgetDeliveredMutation(rid: string, answeredOk = false): void {
     const hit = this.deliveredMutations.get(rid);
     if (!hit) return;
     this.deliveredMutations.delete(rid);
-    // #2955 — both callers are definite outcomes: the panel answered this rid
-    // (settlePendingReply), or the frame was never written (send failure).
+    // #2955 — both callers are definite outcomes: the panel answered THIS rid
+    // definitely (settlePendingReply), or the frame was never written (send failure).
     this.recordMutationSettled(
       rid,
       hit.tabId,

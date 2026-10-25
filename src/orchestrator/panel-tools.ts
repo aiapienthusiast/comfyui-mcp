@@ -403,6 +403,7 @@ import {
   isMidCommandDisconnectTagged,
   isReplyTimeoutTagged,
   isRoutingAmbiguity,
+  replyLeavesOutcomeUnknown,
   requiresWorkflowStampEnforcement,
   type DeliveredMutationReceipt,
   type UncertainTarget,
@@ -1638,12 +1639,14 @@ function isTerminalReconcileReply(cmd: Record<string, unknown>, res: ToolResult)
   if (res.isError || isReplyTimeoutResult(res) || isMidCommandDisconnectResult(res)) return false;
   const body = parseToolResultJson(res);
   if (!body) return false;
+  // The bridge's own settlement classification first (an explicitly unresolved
+  // `applied` or `queued_unknown` is never an outcome), then the stricter bar a
+  // RECONCILIATION needs: the retry must have applied — a deferral or an explicit
+  // `applied:false` is a definite answer, but not one that settles another rid.
   if (
+    replyLeavesOutcomeUnknown({ ok: true, result: body }) ||
     body.deferred === true ||
     body.status === "waiting_for_queue_idle" ||
-    body.queued_unknown === true ||
-    // Any explicit `applied` other than true — false, "unknown", … — is not an
-    // applied outcome, whatever else the reply carries (a `set` included).
     (Object.prototype.hasOwnProperty.call(body, "applied") && body.applied !== true)
   ) {
     return false;

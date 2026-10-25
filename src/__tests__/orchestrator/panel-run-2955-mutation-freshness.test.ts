@@ -1557,6 +1557,143 @@ describe("retry_of settles an unknown edit only on proven same-receiver, same-co
   });
 });
 
+describe("settlement needs the write's OWN definite outcome — waiter completion is not proof (#2955)", () => {
+  const SET_RESULT = {
+    set: { node_id: SAVE_NODE, widget: "filename_prefix", previous: OLD.filename_prefix, value: NEW.filename_prefix },
+  };
+
+  /** A write delivered by ANOTHER session (no intent in the run's ctx), held by the panel. */
+  async function heldForeignWrite(panel: ScriptedPanel, timeoutMs = 60_000) {
+    const sent = bridge
+      .send(
+        { cmd: "graph_set_widget", node_id: SAVE_NODE, widget: "filename_prefix", value: NEW.filename_prefix },
+        { tabId: TAB, timeoutMs },
+      )
+      .then(
+        (result) => ({ settled: "resolved" as const, result }),
+        (err: unknown) => ({ settled: "rejected" as const, result: err }),
+      );
+    await panel.writesArrived(panel.writes.length + 1);
+    const rid = panel.writes[panel.writes.length - 1]?.msg.rid as string;
+    return { sent, rid };
+  }
+
+  it("a FIFO-borrowed ack completes the held write's waiter but not its settlement — the only prerequisite, zero graph_run", async () => {
+    __panelToolsTestHooks.setOutstandingMutationReadSettleMs(40);
+    const panel = await connected();
+    const { sent, rid } = await heldForeignWrite(panel);
+
+    // An ack under a rid nobody is waiting on, for the same node (#2559 FIFO).
+    panel.sock.send(JSON.stringify({ rid: "orphan-ack-2955", ok: true, result: SET_RESULT }));
+    expect((await sent).settled, "the waiter is not stranded").toBe("resolved");
+    expect(bridge.mutationSettlement(rid), "a borrowed ack is not this write's outcome").toBe("unknown");
+
+    const barrier = observeBarrier();
+    const res = await panelRun(newCtx()); // a separate session: no intent can mask the write
+    expect(barrier.calls).toEqual([{ intents: 0, awaited: 0, unknown: 1 }]);
+    expect(res.isError).toBe(true);
+    expect(textOf(res)).toContain(`that edit's own token retry_of:"${rid}"`);
+    expect(panel.runs).toHaveLength(0);
+    expect(panel.applyCount, "the actual write is still held").toBe(0);
+
+    panel.writes[0]?.release(); // its OWN definite reply
+    await waitFor(() => expect(bridge.mutationSettlement(rid)).toBe("settled"));
+    const next = await panelRun(newCtx());
+    expect(next.isError, textOf(next)).not.toBe(true);
+    expect(panel.runs).toHaveLength(1);
+    expect(panel.runs[0]?.serialized.filename_prefix).toBe(NEW.filename_prefix);
+  });
+
+  it('an explicit applied:"unknown" under the write\'s OWN rid does not settle it: a concurrent run from another session refuses', async () => {
+    __panelToolsTestHooks.setRunFreshnessBarrierMs(150);
+    __panelToolsTestHooks.setOutstandingMutationReadSettleMs(40);
+    const panel = await connected();
+    const { sent, rid } = await heldForeignWrite(panel);
+    const barrier = observeBarrier();
+    const run = tracked(panelRun(newCtx()));
+    expect((await firstOf(barrier, panel)).kind).toBe("barrier");
+
+    panel.sock.send(JSON.stringify({ rid, ok: true, result: { applied: "unknown", ...SET_RESULT } }));
+    expect((await sent).settled).toBe("resolved");
+    const res = await run.promise;
+    expect(res.isError).toBe(true);
+    expect(textOf(res)).toContain(`retry_of:"${rid}"`);
+    expect(panel.runs).toHaveLength(0);
+    expect(bridge.mutationSettlement(rid)).toBe("unknown");
+
+    // Its own DEFINITE outcome arrives later: settled, and the run proceeds.
+    panel.sock.send(JSON.stringify({ rid, ok: true, result: { applied: true, ...SET_RESULT } }));
+    await waitFor(() => expect(bridge.mutationSettlement(rid)).toBe("settled"));
+    const next = await panelRun(newCtx());
+    expect(next.isError, textOf(next)).not.toBe(true);
+    expect(panel.runs).toHaveLength(1);
+  });
+
+  it('a LATE applied:"unknown" reply to a timed-out write keeps the receipt unknown; a late definite one settles it', async () => {
+    __panelToolsTestHooks.setOutstandingMutationReadSettleMs(40);
+    const panel = await connected();
+    const { sent, rid } = await heldForeignWrite(panel, 40);
+    expect((await sent).settled).toBe("rejected");
+    expect(bridge.mutationSettlement(rid)).toBe("unknown");
+
+    panel.sock.send(JSON.stringify({ rid, ok: true, result: { applied: "unknown", ...SET_RESULT } }));
+    expect(bridge.peekDeliveredMutation(rid)?.status, "the full receipt is kept").toBe("timed_out");
+    expect(bridge.peekLateMutation(rid), "and no 'it applied' notice is minted").toBeUndefined();
+    const refused = await panelRun(newCtx());
+    expect(refused.isError).toBe(true);
+    expect(panel.runs).toHaveLength(0);
+
+    panel.sock.send(JSON.stringify({ rid, ok: true, result: SET_RESULT }));
+    await waitFor(() => expect(bridge.mutationSettlement(rid)).toBe("settled"));
+    const next = await panelRun(newCtx());
+    expect(next.isError, textOf(next)).not.toBe(true);
+    expect(panel.runs).toHaveLength(1);
+  });
+
+  it('a LATE applied:"unknown" reply to an EVICTED write keeps its marker; a late definite one clears it', async () => {
+    __panelToolsTestHooks.setOutstandingMutationReadSettleMs(40);
+    const panel = await connected();
+    const { sent, rid } = await heldForeignWrite(panel, 40);
+    expect((await sent).settled).toBe("rejected");
+    const realNow = Date.now.bind(Date);
+    vi.spyOn(Date, "now").mockImplementation(() => realNow() + 11 * 60_000);
+    expect(bridge.listUncertainTargets(TAB)[0]?.rids).toEqual([rid]);
+
+    panel.sock.send(JSON.stringify({ rid, ok: true, result: { applied: "unknown", ...SET_RESULT } }));
+    expect(bridge.listUncertainTargets(TAB)[0]?.rids, "an unresolved answer clears nothing").toEqual([rid]);
+    const refused = await panelRun(newCtx());
+    expect(refused.isError).toBe(true);
+    expect(panel.runs).toHaveLength(0);
+
+    panel.sock.send(JSON.stringify({ rid, ok: false, error: "widget write refused by the panel" }));
+    await waitFor(() => expect(bridge.listUncertainTargets(TAB)).toEqual([]));
+    const next = await panelRun(newCtx());
+    expect(next.isError, textOf(next)).not.toBe(true);
+    expect(panel.runs).toHaveLength(1);
+  });
+
+  for (const [label, reply] of [
+    ["applied:true", { ok: true, result: { applied: true, ...SET_RESULT } }],
+    ["a terminal refusal", { ok: false, error: "widget write refused by the panel" }],
+    ["applied:false (nothing applied)", { ok: true, result: { applied: false, reason: "value unchanged" } }],
+  ] as const) {
+    it(`positive control: a definite OWN reply (${label}) settles the write and the concurrent run proceeds`, async () => {
+      const panel = await connected();
+      const { sent, rid } = await heldForeignWrite(panel);
+      const barrier = observeBarrier();
+      const run = tracked(panelRun(newCtx()));
+      expect((await firstOf(barrier, panel)).kind).toBe("barrier");
+
+      panel.sock.send(JSON.stringify({ rid, ...reply }));
+      await sent;
+      const res = await run.promise;
+      expect(res.isError, textOf(res)).not.toBe(true);
+      expect(bridge.mutationSettlement(rid)).toBe("settled");
+      expect(panel.runs).toHaveLength(1);
+    });
+  }
+});
+
 describe("panel_run observes earlier acknowledged mutations before serialization (#2955) — concurrency", () => {
   it("concurrent runs do not wait on each other's graph_run acknowledgement", async () => {
     const sock = await connectPanel();
