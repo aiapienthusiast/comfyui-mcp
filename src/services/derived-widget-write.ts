@@ -97,11 +97,10 @@ const ALL_DERIVED_WIDGET_NAMES: ReadonlySet<string> = new Set([
 
 const OCCURRENCE_SELECTOR = /^(.+)\[(\d+)\]$/;
 
-/** The names the panel could resolve `address` to WITHOUT reading the node's labels:
- *  the whole string, a `NAME[i]` selector base, the dotted head (and its selector
- *  base). Lower-cased, because the panel's #524 fallback matches names
- *  case-insensitively. Display labels need the node's live rows. */
-function syntacticCandidates(address: string): string[] {
+/** Every name the address could reach under ANY of the panel's name forms, lower-cased.
+ *  Deliberately broad: it only decides whether an untyped write is worth one identity
+ *  probe, never whether an address is safe. */
+function broadCandidates(address: string): string[] {
   const out = [address];
   const whole = address.match(OCCURRENCE_SELECTOR);
   if (whole) out.push(whole[1]);
@@ -115,25 +114,20 @@ function syntacticCandidates(address: string): string[] {
   return out.map((candidate) => candidate.toLowerCase());
 }
 
-function guardedNameIn(candidates: readonly string[], names: ReadonlySet<string>): string | null {
-  for (const candidate of candidates) {
-    for (const name of names) {
-      if (name.toLowerCase() === candidate) return name;
-    }
-  }
-  return null;
-}
-
 /** True when `nodeType` has a derived-widget rule. */
 export function isKnownDerivedNodeType(nodeType: string | undefined): boolean {
   return nodeType !== undefined && DERIVED_WIDGET_RULES.has(nodeType);
 }
 
-/** True when `address` could name a guarded widget on SOME known type without a
- *  label lookup (`text`, `TEXT`, `text[0]`, `prompt.x`, …). An untyped write to such
- *  an address is worth one identity probe. */
+/** True when `address` could name a guarded widget on SOME known type under any name
+ *  form (`text`, `TEXT`, `text[0]`, `TEXT.x`, …). An untyped write to such an address
+ *  is worth one identity probe; the probe's row then decides. */
 export function addressMayNameDerivedWidget(address: string): boolean {
-  return guardedNameIn(syntacticCandidates(address), ALL_DERIVED_WIDGET_NAMES) !== null;
+  const candidates = broadCandidates(address);
+  for (const name of ALL_DERIVED_WIDGET_NAMES) {
+    if (candidates.includes(name.toLowerCase())) return true;
+  }
+  return false;
 }
 
 /** True when `widget` (a canonical name echoed by the panel) is guarded on some type. */
@@ -141,11 +135,33 @@ export function isDerivedWidgetName(widget: string): boolean {
   return ALL_DERIVED_WIDGET_NAMES.has(widget);
 }
 
-/** The guarded widget `address` resolves to on `nodeType` by name alone, or null. */
+/**
+ * The guarded widget `address` reaches on `nodeType` WITHOUT reading the node, or null.
+ * Only forms whose resolution cannot depend on display labels are decided here, in the
+ * panel's order (`resolveWidgetAddress`, then `resolveWidgetByName`): the exact name, a
+ * `NAME[i]` selector on an exact name, an exact dotted base, a selector on an exact
+ * dotted base, and a whole-string case-insensitive name (#524 — when one exists the
+ * panel skips its label step). Anything else, e.g. a case-folded dotted base, can be
+ * pre-empted by a label and needs {@link resolveDerivedAddressFromRow}.
+ */
 export function knownDerivedWidgetForAddress(nodeType: string, address: string): string | null {
   const rule = DERIVED_WIDGET_RULES.get(nodeType);
   if (!rule) return null;
-  return guardedNameIn(syntacticCandidates(address), rule.widgets);
+  if (rule.widgets.has(address)) return address;
+  const whole = address.match(OCCURRENCE_SELECTOR);
+  if (whole && rule.widgets.has(whole[1])) return whole[1];
+  const dot = address.indexOf(".");
+  if (dot > 0) {
+    const head = address.slice(0, dot);
+    if (rule.widgets.has(head)) return head;
+    const headSelector = head.match(OCCURRENCE_SELECTOR);
+    if (headSelector && rule.widgets.has(headSelector[1])) return headSelector[1];
+  }
+  const lowered = address.toLowerCase();
+  for (const name of rule.widgets) {
+    if (name.toLowerCase() === lowered) return name;
+  }
+  return null;
 }
 
 export type DerivedAddressResolution =
@@ -159,11 +175,25 @@ function recordOf(value: unknown): Record<string, unknown> | null {
     : null;
 }
 
+/** The panel's `resolveWidgetByName` (#524): an exact name, else the ONE name that
+ *  matches case-insensitively; several case-insensitive matches resolve nothing. */
+function nameLookup(wanted: string, names: ReadonlySet<string>): string | null {
+  if (names.has(wanted)) return wanted;
+  const lowered = wanted.toLowerCase();
+  const folded = [...names].filter((name) => name.toLowerCase() === lowered);
+  return folded.length === 1 ? folded[0] : null;
+}
+
 /**
  * Resolve `address` on a node of a KNOWN derived type from its live detail row
- * (`widgets`, `widget_labels`, `duplicate_widgets`), in the panel's own order. A
- * row the read could not carry completely is `unresolved`: on these node types an
- * address whose target cannot be established is refused, not guessed.
+ * (`widgets`, `widget_labels`, `duplicate_widgets`), following the panel's precedence:
+ * `resolveWidgetAddress` (exact name; whole `NAME[i]`; exact dotted base; `NAME[i]` on
+ * the dotted base; display label, skipped when any name matches the whole string
+ * case-insensitively), then the write's `resolveWidgetByName` (#524 unique
+ * case-insensitive whole name), then its #560 dotted base through that same lookup.
+ * No other semantics are added. A row the read could not carry completely, or a label
+ * two widgets carry (which the panel refuses), is `unresolved`; an address that reaches
+ * no widget is `safe` because the panel refuses it as missing.
  */
 export function resolveDerivedAddressFromRow(
   nodeType: string,
@@ -181,32 +211,52 @@ export function resolveDerivedAddressFromRow(
     return { kind: "unresolved", reason: "the node row omitted widgets to fit its budget" };
   }
   const duplicates = recordOf(row.duplicate_widgets) ?? {};
-  const names = new Set([...Object.keys(widgets), ...Object.keys(duplicates)]);
-  const lowered = syntacticCandidates(address);
-  for (const name of names) {
-    if (lowered.includes(name.toLowerCase())) return { kind: "safe" };
+  const names: ReadonlySet<string> = new Set([...Object.keys(widgets), ...Object.keys(duplicates)]);
+  const verdict = (name: string): DerivedAddressResolution =>
+    rule.widgets.has(name) ? { kind: "guarded", widget: name } : { kind: "safe" };
+
+  // resolveWidgetAddress steps 1-4: exact spellings only.
+  if (names.has(address)) return verdict(address);
+  const whole = address.match(OCCURRENCE_SELECTOR);
+  if (whole && names.has(whole[1])) return verdict(whole[1]);
+  const dot = address.indexOf(".");
+  const head = dot > 0 ? address.slice(0, dot) : null;
+  if (head !== null) {
+    if (names.has(head)) return verdict(head);
+    const headSelector = head.match(OCCURRENCE_SELECTOR);
+    if (headSelector && names.has(headSelector[1])) return verdict(headSelector[1]);
   }
 
-  // Display labels: renamed widgets (`widget_labels`) and per-occurrence labels.
-  const labelled = new Set<string>();
-  const labels = recordOf(row.widget_labels) ?? {};
-  for (const [name, label] of Object.entries(labels)) {
-    if (label === address) labelled.add(name);
-  }
-  for (const [name, rows] of Object.entries(duplicates)) {
-    if (!Array.isArray(rows)) continue;
-    for (const entry of rows) {
-      if (recordOf(entry)?.label === address) labelled.add(name);
+  // Step 5: display labels, unless a name matches the whole string case-insensitively.
+  const lowered = address.toLowerCase();
+  const foldedWhole = [...names].some((name) => name.toLowerCase() === lowered);
+  if (!foldedWhole) {
+    const labelled = new Set<string>();
+    const labels = recordOf(row.widget_labels) ?? {};
+    for (const [name, label] of Object.entries(labels)) {
+      if (label === address) labelled.add(name);
     }
+    for (const [name, rows] of Object.entries(duplicates)) {
+      if (!Array.isArray(rows)) continue;
+      for (const entry of rows) {
+        if (recordOf(entry)?.label === address) labelled.add(name);
+      }
+    }
+    if (labelled.size > 1) {
+      return { kind: "unresolved", reason: `more than one widget is labelled "${address}"` };
+    }
+    const [labelledName] = labelled;
+    if (labelledName !== undefined) return verdict(labelledName);
   }
-  if (labelled.size > 1) {
-    return { kind: "unresolved", reason: `more than one widget is labelled "${address}"` };
+
+  // The write's own lookup: #524 on the whole string, then the #560 dotted base.
+  const folded = nameLookup(address, names);
+  if (folded) return verdict(folded);
+  if (head !== null) {
+    const base = nameLookup(head, names);
+    if (base) return verdict(base);
   }
-  const [labelledName] = labelled;
-  if (labelledName !== undefined) {
-    return rule.widgets.has(labelledName) ? { kind: "guarded", widget: labelledName } : { kind: "safe" };
-  }
-  // No widget, name or label matches: the panel refuses it as a missing widget.
+  // No name or label reaches a widget: the panel refuses it as a missing widget.
   return { kind: "safe" };
 }
 
@@ -227,24 +277,6 @@ export function knownDerivedWidgetRefusalText(
   return (
     `panel_set_widget cannot set "${widget}"${addressed} on ${nodeType}. ` +
     `${rule.reason(nodeType, widget)} No graph_set_widget was dispatched. ${rule.remedy(nodeType)} ` +
-    `Do not retry panel_set_widget on this widget.`
-  );
-}
-
-/** The same fact, stated AFTER a write the panel already acknowledged (an alias that
- *  only resolved on the panel). Nothing is retried or rolled back. */
-export function knownDerivedWidgetAfterWriteText(
-  nodeType: string,
-  widget: string,
-  address: string,
-): string | null {
-  const rule = DERIVED_WIDGET_RULES.get(nodeType);
-  if (!rule || !rule.widgets.has(widget)) return null;
-  return (
-    `panel_set_widget's write to "${address}" was acknowledged by the panel as "${widget}" on ` +
-    `${nodeType}, a widget whose value does not reach execution: ${rule.reason(nodeType, widget)} ` +
-    `The node type could not be read before dispatch, so this was found afterwards. The write ` +
-    `was not retried or rolled back. ${rule.remedy(nodeType)} ` +
     `Do not retry panel_set_widget on this widget.`
   );
 }

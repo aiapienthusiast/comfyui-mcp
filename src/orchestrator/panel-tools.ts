@@ -99,7 +99,6 @@ import {
   addressMayNameDerivedWidget,
   isDerivedWidgetName,
   isKnownDerivedNodeType,
-  knownDerivedWidgetAfterWriteText,
   knownDerivedWidgetForAddress,
   knownDerivedWidgetRefusalText,
   resolveDerivedAddressFromRow,
@@ -8316,37 +8315,39 @@ async function untypedDerivedPreflight(
 }
 
 /** After an untyped write the panel acknowledged: disclose checks that could not
- *  run, and catch a display-label alias the PANEL resolved onto a guarded name
- *  (only knowable from its echo). Never retries or rolls back. */
-async function untypedDerivedAfterWrite(
-  ctx: PanelToolCtx,
+ *  run. A display-label alias the PANEL resolved onto a guarded name is only
+ *  knowable from its echo, and an untyped context has no node incarnation to bind
+ *  a later read to the node that took the write (it may have been replaced, or the
+ *  canvas switched), so the semantic check is reported as unverified — no later
+ *  node's type is ever attributed to this write. Never retries or rolls back. */
+function untypedDerivedAfterWrite(
   written: ToolResult,
-  nodeId: unknown,
   address: string,
   pre: UntypedDerivedCheck,
-): Promise<ToolResult> {
+): ToolResult {
   if (written.isError || pre.kind === "checked") return written;
   const payload = parseToolResultJson(written);
   const set = payload?.set;
   if (!payload || !set || typeof set !== "object" || Array.isArray(set)) return written;
   const unchecked = (reason: string): ToolResult =>
-    withPostWriteReadback(
-      written,
-      payload,
-      unverifiedReadback(
-        `the node type could not be read (${reason}), so the known frontend-owned widget ` +
-          `checks (LoraManager text/loras, MiniMaxH3Easy prompt) did not run`,
-      ),
+    withPostWriteReadback(written, payload, unverifiedReadback(reason));
+  if (pre.kind === "unavailable") {
+    return unchecked(
+      `the node type could not be read (${pre.reason}), so the known frontend-owned widget ` +
+        `checks (LoraManager text/loras, MiniMaxH3Easy prompt) did not run`,
     );
-  if (pre.kind === "unavailable") return unchecked(pre.reason);
+  }
   const echoed = (set as Record<string, unknown>).widget;
   if (typeof echoed !== "string" || echoed === address || !isDerivedWidgetName(echoed)) {
     return written;
   }
-  const read = await readDerivedAddressRow(ctx, nodeId);
-  if ("reason" in read) return unchecked(read.reason);
-  const text = knownDerivedWidgetAfterWriteText(read.type, echoed, address);
-  return text ? fail(text) : written;
+  return unchecked(
+    `the panel resolved "${address}" to "${echoed}", a widget name some node types own ` +
+      `(LoraManager text/loras, MiniMaxH3Easy prompt). The written node's type was not ` +
+      `established before dispatch and no later read can be bound to that node, so whether ` +
+      `this write reaches execution was not checked; read the node's type with ` +
+      `panel_query_graph before relying on it`,
+  );
 }
 
 /** Run the complete known-bad widget refusal set for the node that will actually
@@ -8375,6 +8376,21 @@ async function refuseKnownBadWidgetWrite(
   if (derivedBlocked) return derivedBlocked;
 
   return refuseDaSiWaStackWrite(ctx, nodeId, widget);
+}
+
+/** #2933 review — the ACTUAL linked route a derived widget's host-rail exemption
+ *  needs: an authoritative parent rail AND the terminal node publishing a live input
+ *  of that widget's own name, which is what the subgraph rail links into. The
+ *  broader `innerLinkDriven` host classification (which also admits a host-proven
+ *  STRING mapping whose terminal publishes no such input, #2791) is not enough on
+ *  its own: MiniMaxH3Easy rebuilds an UNLINKED prompt from its editor at queue
+ *  time. That classification stays unchanged for every other node. */
+function promotedTerminalInputRouteProven(
+  terminal: PromotedTerminalWitness | undefined,
+  parentRail: PromotedParentRailWitness | undefined,
+): boolean {
+  if (!terminal || parentRail?.authoritative !== true) return false;
+  return terminal.inputs.some((input) => input.name === terminal.widget);
 }
 
 /** Apply the same known-bad guards to the terminal concrete endpoint
@@ -10092,16 +10108,16 @@ async function preparePromotedWidgetWrite(
     promotedInnerWidgetIsLinkDriven(innerNode, inner.widget, inner.terminal, inner.parentRail);
   if (inner.terminal) {
     const terminalBlocked = refuseKnownBadPromotedTerminal(inner.terminal, {
-      linkedHostRoute: innerLinkDriven,
+      linkedHostRoute:
+        innerLinkDriven && promotedTerminalInputRouteProven(inner.terminal, inner.parentRail),
     });
     if (terminalBlocked) return terminalBlocked;
   } else {
     // #2931 / #2933 — without a terminal witness the mapped inner node is the
     // concrete endpoint (a nested chain was refused above), and a host-first
-    // write reaches it without the inner path's own guard.
-    const derivedBlocked = knownDerivedWidgetRefusal(innerNodeType, inner.widget, {
-      linkedHostRoute: innerLinkDriven,
-    });
+    // write reaches it without the inner path's own guard. No terminal means no
+    // proven linked route, so no derived widget is exempt here.
+    const derivedBlocked = knownDerivedWidgetRefusal(innerNodeType, inner.widget);
     if (derivedBlocked) return derivedBlocked;
   }
   // A receiver that advertises the identity fence must publish the immediate
@@ -22776,9 +22792,7 @@ export function buildPanelToolDefs(): PanelToolDef[] {
           const pre = await untypedDerivedPreflight(ctx, nodeId, widget);
           if ("content" in pre) return pre;
           return untypedDerivedAfterWrite(
-            ctx,
             await write(nodeId, widget, targetExpectedNodeType),
-            nodeId,
             widget,
             pre,
           );
@@ -22823,10 +22837,13 @@ export function buildPanelToolDefs(): PanelToolDef[] {
             // when the #2488 host-rail write already contradicted.
             if (plan.innerLinkDriven) {
               if (plan.terminal) {
-                // This branch writes only the host rail, the established route
-                // for a link-driven inner, so a linked H3 prompt may take it.
+                // This branch writes only the host rail. A derived widget may take
+                // it only when the terminal's own linked input route is proven.
                 const terminalBlocked = refuseKnownBadPromotedTerminal(plan.terminal, {
-                  linkedHostRoute: true,
+                  linkedHostRoute: promotedTerminalInputRouteProven(
+                    plan.terminal,
+                    plan.inner.parentRail,
+                  ),
                 });
                 if (terminalBlocked) return terminalBlocked;
               }
@@ -23245,16 +23262,7 @@ export function buildPanelToolDefs(): PanelToolDef[] {
           ordinaryPlan ? ordinaryReadbackScope(ordinaryPlan) : undefined,
         );
         if (untypedDerived && !first.isError) {
-          first = await untypedDerivedAfterWrite(
-            ctx,
-            first,
-            args.node_id,
-            args.widget as string,
-            untypedDerived,
-          );
-          // A post-dispatch finding is a verdict on an acknowledged write, not a
-          // refusal for the recovery paths below to reinterpret.
-          if (first.isError) return first;
+          first = untypedDerivedAfterWrite(first, args.widget as string, untypedDerived);
         }
         if (!first.isError) {
           if (parseToolResultJson(first)?.refresh_pending !== true) {

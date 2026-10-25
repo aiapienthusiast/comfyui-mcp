@@ -1572,6 +1572,53 @@ describe("panel_set_widget promoted derived widgets: host rail vs inner (#2933 r
     expect(calls.filter((call) => call.cmd === "graph_set_widget")).toHaveLength(0);
   });
 
+  it("refuses an H3 prompt whose host-proven STRING mapping reaches no terminal prompt input", async () => {
+    // #2791's host-proven STRING shape (host input + proxyWidgets, incomplete terminal
+    // witness) makes the generic host classification write the host. For H3 that is not
+    // proof of a LINKED prompt: the terminal publishes no `prompt` input, and an
+    // unlinked prompt is rebuilt from the editor at queue time.
+    const host = {
+      nodes: [
+        {
+          id: 12,
+          type: "SubgraphNode",
+          is_subgraph: true,
+          widgets: { prompt: "old" },
+          inputs: [{ label: "prompt", name: "prompt", type: "STRING", widget: { name: "prompt" } }],
+          properties: { proxyWidgets: [["140", "prompt"]] },
+        },
+      ],
+    };
+    const subgraph = {
+      subgraph_of: { node_id: 12, title: "H3 shot" },
+      node_count: 1,
+      nodes: [{ id: 140, type: "MiniMaxH3Easy", widgets: { prompt: "old" }, inputs: [] }],
+      promoted_terminals: [
+        {
+          widget: "prompt",
+          immediate_node_id: 140,
+          immediate_widget: "prompt",
+          error: "the promoted parent rail was missing, externally linked, or not authoritative",
+        },
+      ],
+    };
+    const { text, isError, calls, mutations } = await setWidget(
+      { node_id: 12, widget: "prompt", value: "a new shot" },
+      {
+        ownerNodeId: 12,
+        firstWrite: "ok",
+        promotedTerminalWitnesses: true,
+        promotedDetail: host,
+        subgraph,
+      },
+    );
+
+    expect(isError).toBe(true);
+    expect(text).toMatch(/cannot set "prompt" on MiniMaxH3Easy/);
+    expect(mutations).toBe(0);
+    expect(calls.filter((call) => call.cmd === "graph_set_widget")).toHaveLength(0);
+  });
+
   it("refuses LoraManager text even on an authoritative linked host rail", async () => {
     const { text, isError, calls, mutations } = await setWidget(
       { node_id: 12, widget: "text", value: "<lora:a:1>" },

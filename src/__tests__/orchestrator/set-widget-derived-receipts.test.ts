@@ -68,6 +68,10 @@ type Harness = {
   /** Every node read fails (identity unavailable). */
   readsFail?: boolean;
   setReplyExtras?: Record<string, unknown>;
+  /** The node that answers later reads is a replacement of this type. */
+  typeAfterWrite?: string;
+  /** The canvas switched workflow/graph after the write. */
+  graphAfterWrite?: string;
 };
 
 let sent: Sent[] = [];
@@ -78,35 +82,45 @@ const textOf = (res: ToolResult): string =>
 
 const cmds = (): string[] => sent.map((s) => s.cmd);
 
-/** The panel's resolveWidgetAddress order, reduced to what these tests use. */
+/** The panel's resolveWidgetAddress + resolveWidgetByName order, reduced to what these
+ *  tests use: exact name, NAME[i], exact dotted base, then a display label (skipped
+ *  when the whole string matches a name case-insensitively), then the unique
+ *  case-insensitive whole name (#524), then the case-insensitive dotted base (#560). */
 function resolveAddress(
   address: string,
   live: Record<string, unknown>,
   labels: Record<string, string>,
 ): string {
-  if (address in live) return address;
+  const names = Object.keys(live);
+  if (names.includes(address)) return address;
   const selector = address.match(/^(.+)\[(\d+)\]$/);
-  if (selector && selector[1] in live) return selector[1];
+  if (selector && names.includes(selector[1])) return selector[1];
   const dot = address.indexOf(".");
-  if (dot > 0 && address.slice(0, dot) in live) return address;
-  const ci = Object.keys(live).find((name) => name.toLowerCase() === address.toLowerCase());
-  if (ci) return ci;
-  const labelled = Object.entries(labels).find(([, label]) => label === address);
-  return labelled ? labelled[0] : address;
+  const head = dot > 0 ? address.slice(0, dot) : null;
+  if (head && names.includes(head)) return head;
+  const fold = (wanted: string) => names.filter((n) => n.toLowerCase() === wanted.toLowerCase());
+  if (fold(address).length === 0) {
+    const labelled = Object.entries(labels).filter(([, label]) => label === address);
+    if (labelled.length === 1) return labelled[0][0];
+  }
+  if (fold(address).length === 1) return fold(address)[0];
+  if (head && fold(head).length === 1) return fold(head)[0];
+  return address;
 }
 
 function makeBridge(h: Harness): PanelToolCtx["bridge"] {
   const live: Record<string, unknown> = { ...(h.widgets ?? { text: OLD_PROMPT }) };
   const labels = h.labels ?? {};
-  const nodeType = h.nodeType ?? "CLIPTextEncode";
+  let nodeType = h.nodeType ?? "CLIPTextEncode";
+  let graphIdentity = GRAPH_ID;
   let wrote = false;
   let generation = 1;
-  const viewing = (graphIdentity = GRAPH_ID) => ({
+  const viewing = (graph = graphIdentity) => ({
     scope: "root",
     kind: "root",
     workflow: "derived-receipts.json",
     workflow_uuid: WORKFLOW_UUID,
-    graph_identity: graphIdentity,
+    graph_identity: graph,
   });
   const row = (widgets: Record<string, unknown>, nodeIdentity = NODE_IDENTITY) => ({
     id: NODE_ID,
@@ -133,6 +147,8 @@ function makeBridge(h: Harness): PanelToolCtx["bridge"] {
         const previous = live[widget];
         live[widget] = cmd.value;
         wrote = true;
+        if (h.typeAfterWrite) nodeType = h.typeAfterWrite;
+        if (h.graphAfterWrite) graphIdentity = h.graphAfterWrite;
         if (h.afterWrite) setTimeout(() => h.afterWrite!(live), 0);
         return {
           set: { node_id: cmd.node_id, widget, previous, value: cmd.value },
@@ -416,6 +432,62 @@ describe("aliases cannot walk past the refusal (#2931 review P1)", () => {
     expect(out.text).toMatch(/more than one widget is labelled "dup"/);
     expect(dispatchedWrites).toBe(0);
   });
+
+  // Round-2 review: a case-folded dotted base is NOT an exact dotted base. The
+  // panel's exact-base step misses STRENGTH_MODEL, and its label step resolves
+  // the whole string to `text` before any case-folded lookup runs.
+  it("refuses a label that the panel resolves before a case-folded dotted base", async () => {
+    const out = await setWidget(
+      {
+        nodeType: LORA_LOADER,
+        widgets: { text: "", strength_model: 1 },
+        labels: { text: "STRENGTH_MODEL.value" },
+      },
+      { node_id: NODE_ID, widget: "STRENGTH_MODEL.value", value: "<lora:a:1>" },
+    );
+
+    expect(out.isError).toBe(true);
+    expect(out.text).toContain(
+      `cannot set "text" (addressed as "STRENGTH_MODEL.value") on ${LORA_LOADER}`,
+    );
+    expect(dispatchedWrites).toBe(0);
+  });
+
+  it("control: an EXACT dotted base wins over the same label", async () => {
+    const out = await setWidget(
+      {
+        nodeType: LORA_LOADER,
+        widgets: { text: "", strength_model: 1 },
+        labels: { text: "strength_model.value" },
+      },
+      { node_id: NODE_ID, widget: "strength_model.value", value: "0.5" },
+    );
+
+    expect(out.text).not.toMatch(/cannot set|could not be resolved/);
+    expect(dispatchedWrites).toBe(1);
+    expect(sent.find((c) => c.cmd === "graph_set_widget")?.payload.widget).toBe("strength_model.value");
+  });
+
+  it("refuses a case-folded dotted base onto `text` when no label intervenes (#560)", async () => {
+    const out = await setWidget(
+      { nodeType: LORA_LOADER, widgets: { text: "", strength_model: 1 } },
+      { node_id: NODE_ID, widget: "TEXT.value", value: "<lora:a:1>" },
+    );
+
+    expect(out.isError).toBe(true);
+    expect(out.text).toContain(`cannot set "text" (addressed as "TEXT.value") on ${LORA_LOADER}`);
+    expect(dispatchedWrites).toBe(0);
+  });
+
+  it("control: a case-folded dotted base onto an unrelated widget is written", async () => {
+    const out = await setWidget(
+      { nodeType: LORA_LOADER, widgets: { text: "", strength_model: 1 } },
+      { node_id: NODE_ID, widget: "STRENGTH_MODEL.value", value: "0.5" },
+    );
+
+    expect(out.text).not.toMatch(/cannot set|could not be resolved/);
+    expect(dispatchedWrites).toBe(1);
+  });
 });
 
 describe("untyped (legacy) writes probe guarded names and disclose what they could not check", () => {
@@ -470,23 +542,59 @@ describe("untyped (legacy) writes probe guarded names and disclose what they cou
     expect(String(readback.note)).toMatch(/not a durability or execution claim/);
   });
 
-  it("catches a label the panel resolved onto LoraManager `text`, without replaying it", async () => {
+  // Round-2 review: a legacy context has no node incarnation, so no later read can be
+  // bound to the node that took the write. The semantic check is reported as
+  // unverified, and no node type is attributed to the write.
+  it.each([
+    ["the written node is still a LoraManager node", { nodeType: LORA_LOADER }],
+    [
+      "the node was replaced by a LoraManager node after the write",
+      { nodeType: "CLIPTextEncode", typeAfterWrite: LORA_LOADER },
+    ],
+    [
+      "the LoraManager node was replaced by a plain node after the write",
+      { nodeType: LORA_LOADER, typeAfterWrite: "CLIPTextEncode" },
+    ],
+    [
+      "the canvas switched workflow after the write",
+      { nodeType: LORA_LOADER, graphAfterWrite: "graph:other-workflow" },
+    ],
+  ] as const)(
+    "keeps a label alias the panel resolved onto `text` acknowledged but unverified when %s",
+    async (_label, shape) => {
+      const out = await setWidget(
+        {
+          legacy: true,
+          widgets: { text: "", loras: [] },
+          labels: { text: "LoRA syntax" },
+          ...shape,
+        },
+        { node_id: NODE_ID, widget: "LoRA syntax", value: "<lora:a:1>" },
+      );
+
+      expect(out.isError).toBe(false);
+      expect(out.json?.set).toMatchObject({ widget: "text", value: "<lora:a:1>" });
+      const readback = readbackOf(out.json);
+      expect(readback.status).toBe("unverified");
+      expect(String(readback.reason)).toMatch(/resolved "LoRA syntax" to "text"/);
+      expect(String(readback.reason)).toMatch(/no later read can be bound to that node/);
+      expect(String(readback.note)).toMatch(/panel acknowledged this write/);
+      // No node type is asserted for the write, and no read is taken to "find" one.
+      expect(out.text).not.toMatch(/on Lora Loader \(LoraManager\)|on CLIPTextEncode/);
+      expect(cmds()).toEqual(["graph_set_widget"]);
+      expect(dispatchedWrites).toBe(1);
+    },
+  );
+
+  it("leaves a legacy label alias onto an unguarded widget unchanged", async () => {
     const out = await setWidget(
-      {
-        legacy: true,
-        nodeType: LORA_LOADER,
-        widgets: { text: "", loras: [] },
-        labels: { text: "LoRA syntax" },
-      },
-      { node_id: NODE_ID, widget: "LoRA syntax", value: "<lora:a:1>" },
+      { legacy: true, widgets: { seed: 1 }, labels: { seed: "Seed value" } },
+      { node_id: NODE_ID, widget: "Seed value", value: "7" },
     );
 
-    expect(out.isError).toBe(true);
-    expect(out.text).toMatch(/acknowledged by the panel as "text" on Lora Loader \(LoraManager\)/);
-    expect(out.text).toMatch(/not retried or rolled back/);
-    // No probe before (the label could not be known), one read after, no replay.
-    expect(cmds()).toEqual(["graph_set_widget", "graph_query"]);
-    expect(dispatchedWrites).toBe(1);
+    expect(out.isError).toBe(false);
+    expect(out.json?.post_write_readback).toBeUndefined();
+    expect(cmds()).toEqual(["graph_set_widget"]);
   });
 });
 
