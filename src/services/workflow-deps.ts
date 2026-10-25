@@ -54,6 +54,8 @@ export interface ManagerNodePack {
   version?: string;
   channel?: string;
   mode?: string;
+  /** The key `/customnode/getlist` filed this entry under (absent for an array-shaped list). */
+  listKey?: string;
 }
 
 /** getlist response shape (Manager returns { channel, node_packs: {...} }). */
@@ -236,6 +238,26 @@ async function managerFetch(
   return res;
 }
 
+/**
+ * The install task the default adapter sends for one Manager list entry. Shared with
+ * installTargetRefusal so the target that is validated is the one that is sent.
+ */
+export function managerInstallParams(pack: ManagerNodePack, channel: string) {
+  // A plain/non-registry pack (git URL, no registry version) must route on
+  // version === "unknown"; a registry pack installs its catalog version.
+  const isUnknown = !pack.version || pack.version === "unknown";
+  return {
+    id: pack.id,
+    version: isUnknown ? "unknown" : pack.version,
+    selected_version: pack.active_version ?? (isUnknown ? undefined : pack.version),
+    repository: pack.reference,
+    files: pack.files,
+    channel: pack.channel ?? channel,
+    mode: pack.mode ?? "cache",
+    ui_id: pack.id ?? pack.title ?? pack.reference,
+  };
+}
+
 /** Default dependency wiring backed by live HTTP + the ComfyUI client. */
 export function defaultWorkflowDepsDeps(): WorkflowDepsDeps {
   // installWorkflowDependencies invokes reset → N enqueues → start → status as
@@ -265,26 +287,14 @@ export function defaultWorkflowDepsDeps(): WorkflowDepsDeps {
       const packs = data.node_packs ?? {};
       return {
         channel: data.channel,
-        // Fold the dict key into each entry's id when missing.
-        packs: Object.entries(packs).map(([key, p]) => ({ id: p.id ?? key, ...p })),
+        // Fold the dict key into each entry's id when missing, and keep the key itself:
+        // Manager resolves an unknown-version install through it (#2765).
+        packs: Object.entries(packs).map(([key, p]) => ({ id: p.id ?? key, ...p, listKey: key })),
       };
     },
     queueInstall: async (pack, channel) => {
-      // A plain/non-registry pack (git URL, no registry version) must route on
-      // version === "unknown"; a registry pack installs its catalog version.
-      const isUnknown = !pack.version || pack.version === "unknown";
       const base = queueOperation?.base ?? managerBase();
-      const used = await enqueueManagerTaskForExternal("install", {
-          id: pack.id,
-          version: isUnknown ? "unknown" : pack.version,
-          selected_version:
-            pack.active_version ?? (isUnknown ? undefined : pack.version),
-          repository: pack.reference,
-          files: pack.files,
-          channel: pack.channel ?? channel,
-          mode: pack.mode ?? "cache",
-          ui_id: pack.id ?? pack.title ?? pack.reference,
-      }, base);
+      const used = await enqueueManagerTaskForExternal("install", managerInstallParams(pack, channel), base);
       if (queueOperation) queueOperation.api = used;
     },
     resetQueue: async () => {
@@ -365,9 +375,10 @@ function packFromPythonModule(pythonModule: string | undefined): {
  * A pattern is discarded when it visibly constrains nothing: it has no literal letter or
  * digit outside character classes and escapes (`.*`, `^[^\x00]+$`, `\w+`), or it matches
  * one of these generic probes (`Foo|.*`, `(?:Foo)?`). This is a HEURISTIC that removes the
- * forms known to attribute everything; passing it proves nothing about ownership. What
- * stops a surviving pattern naming an owner wrongly is resolveFromMappings: it names one
- * only when no other repository claims the class at all.
+ * forms known to attribute everything; passing it proves nothing about ownership. Nor does
+ * resolveFromMappings prove it: naming an owner only when no other repository claims the
+ * class stops a choice among competing claims, but an uncontested claim can still be wrong.
+ * That is why a pattern-only answer is labelled `manager_pattern`.
  */
 const GENERIC_PROBES = ["", "\u0000comfyui-mcp:no-pack-names-this\u0000", "x", "KSampler", "Load Image", "ノード"];
 
@@ -718,6 +729,49 @@ function isRepositoryUrl(key: string): boolean {
   return /^[a-z][a-z0-9+.-]*:\/\//i.test(key) || key.startsWith("git@");
 }
 
+/**
+ * #2765 — check what a legacy Manager would actually install for `entry` against the
+ * resolved repository `repo`. A matching `id`, `reference` or `files` member only selects
+ * the entry. The target is set by the task managerInstallParams sends and by how the
+ * /manager/queue/install worker reads it (Comfy-Org/ComfyUI-Manager glob/manager_server.py
+ * _queue_node_install, glob/manager_core.py install_by_id / get_custom_nodes):
+ *  - version "unknown" (git): the worker takes basename(files[0]), looks that name up among
+ *    its own getlist keys (case-insensitively) and clones that entry's files[0].
+ *  - otherwise (registry, nightly included): it installs registry id `id`. Manager itself
+ *    gave the entry that id from its single `files` URL (get_cnr_by_repo), which is the
+ *    binding accepted when `repo` is a URL rather than the id.
+ * An entry naming several repositories is refused in every mode. Returns the reason the
+ * entry must not be queued, or null when its install target is `repo`.
+ */
+function installTargetRefusal(
+  entry: ManagerNodePack,
+  repo: string,
+  packs: ManagerNodePack[],
+  channel: string,
+): string | null {
+  const files = entry.files ?? [];
+  if (files.length > 1)
+    return `its Manager install descriptor names ${files.length} repositories (${files.join(", ")}), so none was queued`;
+  const task = managerInstallParams(entry, channel);
+  const gitInstall = task.version === "unknown";
+  // Where the descriptor is bound to `repo` by URL, a reference naming another repository
+  // contradicts it. (A registry-id binding is unaffected: its reference is registry metadata.)
+  if ((gitInstall || files[0] === repo) && task.repository !== undefined && task.repository !== repo)
+    return `its Manager install descriptor names both ${files[0] ?? "no clone URL"} and ${task.repository}, so it was not queued`;
+  if (gitInstall) {
+    if (files[0] !== repo)
+      return `its Manager install descriptor would clone ${files[0] ?? "nothing"}, not ${repo}, so it was not queued`;
+    const name = (repo.split("/").pop() ?? "").trim().toLowerCase();
+    const resolvedBy = packs.filter((p) => (p.listKey ?? p.id ?? "").trim().toLowerCase() === name);
+    if (resolvedBy.length !== 1 || resolvedBy[0] !== entry)
+      return `Manager resolves this git install by the name "${name}", which does not select exactly this descriptor, so it was not queued`;
+    return null;
+  }
+  if (task.id === repo) return null;
+  if (isRepositoryUrl(repo) && files[0] === repo) return null;
+  return `its Manager install descriptor installs registry id ${task.id ?? "(none)"}, which is not bound to ${repo}, so it was not queued`;
+}
+
 export async function installWorkflowDependenciesForAnalysis(
   analysis: ExtractDepsResult,
   deps: WorkflowDepsDeps,
@@ -801,8 +855,20 @@ export async function installWorkflowDependenciesForAnalysis(
     const matches = packs.filter((p) => p.id === repo || p.reference === repo || (p.files ?? []).includes(repo));
     if (matches.length !== 1) {
       unresolved.push(pack);
-      if (matches.length > 1)
-        targetRefusals.push({ pack, reason: `${repo} matches ${matches.length} Manager list entries, so none was queued` });
+      targetRefusals.push({
+        pack,
+        reason:
+          matches.length === 0
+            ? `no Manager install descriptor names ${repo}, so it was not queued`
+            : `${repo} matches ${matches.length} Manager list entries, so none was queued`,
+      });
+      continue;
+    }
+    // Matching selected the descriptor; it does not show what the descriptor installs.
+    const refusal = installTargetRefusal(matches[0], repo, packs, channel);
+    if (refusal) {
+      unresolved.push(pack);
+      targetRefusals.push({ pack, reason: refusal });
       continue;
     }
     if (!toInstall.includes(matches[0])) toInstall.push(matches[0]);

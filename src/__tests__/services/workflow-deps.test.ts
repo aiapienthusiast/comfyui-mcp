@@ -69,6 +69,9 @@ function makeDeps(overrides: Partial<WorkflowDepsDeps> = {}): WorkflowDepsDeps {
   const list: ManagerNodePack[] = [
     {
       id: "Remote-Only-Pack",
+      // The key Manager files an unregistered pack under (its repository basename);
+      // a git install is resolved through it (#2765).
+      listKey: "remote-only",
       title: "Remote-Only-Pack",
       reference: "https://github.com/someone/remote-only",
       files: ["https://github.com/someone/remote-only"],
@@ -103,6 +106,19 @@ describe("default WorkflowDeps Manager dialect routing", () => {
     expect(fetchMock.mock.calls[0][0]).toBe(
       "http://127.0.0.1:8188/v2/customnode/getmappings?mode=nickname",
     );
+  });
+
+  it("keeps each legacy getlist key on its entry: Manager resolves a git install through it (#2765)", async () => {
+    resetManagerApiCacheForTests("legacy");
+    const body = {
+      channel: "default",
+      node_packs: { "widget-pack": { id: "declared-id", files: ["https://github.com/a/widget-pack"], version: "unknown" } },
+    };
+    vi.stubGlobal("fetch", vi.fn(async () => new Response(JSON.stringify(body), { status: 200 })));
+    const list = await defaultWorkflowDepsDeps().fetchManagerList();
+    expect(list.packs).toEqual([
+      { id: "declared-id", files: ["https://github.com/a/widget-pack"], version: "unknown", listKey: "widget-pack" },
+    ]);
   });
 });
 

@@ -3,6 +3,7 @@ import {
   extractWorkflowDependencies,
   installWorkflowDependencies,
   installWorkflowDependenciesForAnalysis,
+  managerInstallParams,
   type ManagerNodePack,
   type NodeDependency,
   type WorkflowDepsDeps,
@@ -459,7 +460,7 @@ describe("#2765 install_deps enqueues exactly the resolved repository", () => {
   it("title-vs-id collision: another entry whose ID equals the resolved title is not queued", async () => {
     const m: Mappings = { [A]: [["Widget"], { title: "Shared Tools" }] };
     const impostor: ManagerNodePack = { id: "Shared Tools", title: "Impostor", reference: B, files: [B] };
-    const real: ManagerNodePack = { id: "a-shared", title: "Shared Tools", reference: A, files: [A] };
+    const real: ManagerNodePack = { id: "a-shared", listKey: "shared-tools", title: "Shared Tools", reference: A, files: [A] };
     for (const packs of [[impostor, real], [real, impostor]]) {
       const d = legacy(m, packs);
       const result = await installWorkflowDependencies(wf("Widget"), d);
@@ -490,6 +491,7 @@ describe("#2765 install_deps enqueues exactly the resolved repository", () => {
     const d = legacy(m, [{ id: "other", title: "Shared Tools", reference: B, files: [B] }]);
     const result = await installWorkflowDependencies(wf("Widget"), d);
     expect(result.unresolved).toEqual(["Shared Tools"]);
+    expect(result.target_refusals).toEqual([{ pack: "Shared Tools", reason: `no Manager install descriptor names ${A}, so it was not queued` }]);
     expect(d.queueInstall).not.toHaveBeenCalled();
   });
 
@@ -521,5 +523,106 @@ describe("#2765 install_deps enqueues exactly the resolved repository", () => {
     expect(result.installed).toEqual([]);
     expect(result.target_refusals).toEqual([{ pack: "Shared", reason: "no resolved repository identity, so it was not queued" }]);
     expect(d.queueInstall).not.toHaveBeenCalled();
+  });
+});
+
+describe("#2765 legacy install: the descriptor's effective target must be the resolved repository", () => {
+  const A = "https://github.com/a/widget-pack";
+  const B = "https://github.com/b/other-pack";
+  const BY_URL: Mappings = { [A]: [["Widget"], { title: "Widget Pack" }] };
+  const BY_ID: Mappings = { "comfyui-widget": [["Widget"], { title: "Widget Pack" }] };
+
+  function legacy(m: Mappings, packs: ManagerNodePack[]): WorkflowDepsDeps {
+    const d = deps(m);
+    d.fetchManagerList = vi.fn(async () => ({ channel: "default", packs }));
+    return d;
+  }
+
+  async function expectRefused(m: Mappings, packs: ManagerNodePack[], reason: RegExp): Promise<void> {
+    const d = legacy(m, packs);
+    const result = await installWorkflowDependencies(wf("Widget"), d);
+    expect(result.installed).toEqual([]);
+    expect(result.unresolved).toEqual(["Widget Pack"]);
+    expect(result.target_refusals).toHaveLength(1);
+    expect(result.target_refusals?.[0]).toMatchObject({ pack: "Widget Pack" });
+    expect(result.target_refusals?.[0].reason).toMatch(reason);
+    expect(d.resetQueue).not.toHaveBeenCalled();
+    expect(d.queueInstall).not.toHaveBeenCalled();
+    expect(d.startQueue).not.toHaveBeenCalled();
+  }
+
+  it("refuses a sole descriptor whose reference names A but whose git clone target is B", async () => {
+    // Astra's reproduction: selected through `reference === A`, would clone files[0] = B.
+    await expectRefused(BY_URL, [{ id: "other-pack", reference: A, files: [B], version: "unknown" }], /would clone .*other-pack, not .*widget-pack/);
+  });
+
+  it("refuses a compound descriptor rather than expanding one identity into several repositories", async () => {
+    await expectRefused(BY_URL, [{ listKey: "widget-pack", id: "widget-pack", reference: A, files: [A, B], version: "unknown" }], /names 2 repositories/);
+    await expectRefused(BY_ID, [{ id: "comfyui-widget", files: [A, B], version: "1.2.0" }], /names 2 repositories/);
+  });
+
+  it("refuses a git install whose name Manager would resolve to a different descriptor", async () => {
+    // basename(A) = "widget-pack" is another entry's key, so Manager would clone ITS files[0].
+    await expectRefused(
+      BY_URL,
+      [
+        { listKey: "widget-pack-mirror", id: "widget-pack-mirror", reference: A, files: [A], version: "unknown" },
+        { listKey: "widget-pack", id: "widget-pack", reference: B, files: [B], version: "unknown" },
+      ],
+      /resolves this git install by the name "widget-pack"/,
+    );
+  });
+
+  it("refuses a git descriptor whose reference contradicts its clone target", async () => {
+    await expectRefused(BY_URL, [{ listKey: "widget-pack", id: "widget-pack", reference: B, files: [A], version: "unknown" }], /names both/);
+  });
+
+  it("refuses a registry descriptor whose id is not bound to the resolved repository", async () => {
+    await expectRefused(BY_URL, [{ id: "comfyui-widget", reference: A, files: [B], version: "1.2.0" }], /registry id comfyui-widget, which is not bound/);
+  });
+
+  it("a repository with no matching install descriptor is a target refusal, not 'not found'", async () => {
+    await expectRefused(BY_URL, [{ listKey: "other-pack", id: "other-pack", reference: B, files: [B], version: "unknown" }], /no Manager install descriptor names/);
+  });
+
+  it("control: git install of the resolved repository, exact payload", async () => {
+    const entry: ManagerNodePack = { listKey: "widget-pack", id: "widget-pack", reference: A, files: [A], version: "unknown" };
+    const d = legacy(BY_URL, [{ listKey: "other-pack", id: "other-pack", reference: B, files: [B], version: "unknown" }, entry]);
+    const result = await installWorkflowDependencies(wf("Widget"), d);
+    expect(vi.mocked(d.queueInstall).mock.calls).toEqual([[entry, "default"]]);
+    expect(result.installed).toEqual(["Widget Pack"]);
+    expect(result.target_refusals).toBeUndefined();
+    expect(managerInstallParams(entry, "default")).toEqual({
+      id: "widget-pack",
+      version: "unknown",
+      selected_version: undefined,
+      repository: A,
+      files: [A],
+      channel: "default",
+      mode: "cache",
+      ui_id: "widget-pack",
+    });
+  });
+
+  it("control: registered install bound by registry id, exact payload (the id is not a URL)", async () => {
+    const entry: ManagerNodePack = {
+      id: "comfyui-widget",
+      reference: "https://registry.comfy.org/nodes/comfyui-widget",
+      files: [A],
+      version: "1.2.0",
+    };
+    const d = legacy(BY_ID, [entry]);
+    const result = await installWorkflowDependencies(wf("Widget"), d);
+    expect(vi.mocked(d.queueInstall).mock.calls).toEqual([[entry, "default"]]);
+    expect(result.installed).toEqual(["Widget Pack"]);
+    expect(managerInstallParams(entry, "default")).toMatchObject({ id: "comfyui-widget", version: "1.2.0", selected_version: "1.2.0" });
+  });
+
+  it("control: registered install of a URL-keyed repository bound through its single files URL", async () => {
+    const entry: ManagerNodePack = { id: "comfyui-widget", reference: A, files: [A], version: "1.2.0" };
+    const d = legacy(BY_URL, [entry]);
+    const result = await installWorkflowDependencies(wf("Widget"), d);
+    expect(vi.mocked(d.queueInstall).mock.calls).toEqual([[entry, "default"]]);
+    expect(result.installed).toEqual(["Widget Pack"]);
   });
 });
