@@ -33,6 +33,7 @@ import { waitFor } from "../helpers/wait-for.js";
 
 const TAB = "wf:workflows/chizu_scout.json";
 const TAB2 = "wf:workflows/other_canvas.json";
+const TAB3 = "wf:workflows/third_canvas.json";
 const WORKFLOW_UUID = "22222222-2222-4222-8222-222222222222";
 const PROMPT_NODE = 6;
 const SAVE_NODE = 9;
@@ -1173,7 +1174,7 @@ describe("panel_run never reads forgotten receipt history as freshness (#2955)",
     expect(panel.runs).toHaveLength(1);
   });
 
-  it("capacity overflow on another tab cannot evict this tab's awaiting write; the overflowed tab keeps its uncertainty until its browser tab is retired", async () => {
+  it("capacity overflow on another tab cannot evict this tab's awaiting write; the overflowed tab's uncertainty survives disconnects and binds only its own document", async () => {
     __panelToolsTestHooks.setRunFreshnessBarrierMs(80);
     __panelToolsTestHooks.setOutstandingMutationReadSettleMs(40);
     bridge.setTabGoneListener(() => {}, { graceMs: 60_000 });
@@ -1327,6 +1328,94 @@ describe("retry_of settles an unknown edit only on proven same-receiver, same-co
     const res = await panelRun(newCtx());
     expect(res.isError).toBe(true);
     expect(textOf(res)).toContain(`retry_of:"${token}"`);
+    expect(panel.runs).toHaveLength(0);
+  });
+
+  it("a retry answered by a DIFFERENT browser document under the same tab key does not settle the original document's edit", async () => {
+    __panelToolsTestHooks.setOutstandingMutationReadSettleMs(40);
+    const panel = await connected({ ledger: true });
+    const first = await setWidget(slowWriteCtx(), SAVE_NODE, "filename_prefix", NEW.filename_prefix);
+    const token = tokenOf(first);
+    panel.sock.close();
+    await waitFor(() => expect(bridge.canReach(TAB)).toBe(false));
+
+    // Another browser tab opens the same workflow under the same key. Its ledger has
+    // never seen the token: the replayed frame runs fresh there and succeeds.
+    const second = attachPanel(await connectPanel(TAB, "browser-tab-2955-second-document"), { ledger: true });
+    await waitFor(() => expect(bridge.canReach(TAB)).toBe(true));
+    const retry = defByName("panel_set_widget").handler(
+      { node_id: SAVE_NODE, widget: "filename_prefix", value: NEW.filename_prefix, retry_of: token } as never,
+      slowWriteCtx(),
+    );
+    await second.writesArrived(1);
+    second.writes[0]?.release();
+    expect((await retry).isError).not.toBe(true);
+    expect(bridge.mutationSettlement(token), "another document's answer is not this edit's outcome").toBe("unknown");
+
+    // The ORIGINAL document comes back: its edit's outcome is still unknown.
+    second.sock.close();
+    await waitFor(() => expect(bridge.canReach(TAB)).toBe(false));
+    const back = attachPanel(await connectPanel());
+    await waitFor(() => expect(bridge.canReach(TAB)).toBe(true));
+    const res = await panelRun(newCtx());
+    expect(res.isError).toBe(true);
+    expect(textOf(res)).toContain(`retry_of:"${token}"`);
+    expect(back.runs).toHaveLength(0);
+  });
+
+  it("the same document re-registered under ANOTHER workflow tab id cannot settle the first tab's edit (tab binding)", async () => {
+    __panelToolsTestHooks.setOutstandingMutationReadSettleMs(40);
+    const panel = await connected({ dropFirst: "graph_move_node" });
+    const lost = await bridge
+      .send({ cmd: "graph_move_node", node_id: 4, pos: [0, 0] }, { tabId: TAB, timeoutMs: 40 })
+      .then(
+        () => "acked",
+        () => "timed out",
+      );
+    expect(lost).toBe("timed out");
+    const original = bridge.listOutstandingMutations(TAB)[0]?.rid as string;
+    // Same socket, same browser document, now registered under another workflow
+    // tab id. The stamp resolver is constant here, so the tab id is the only thing
+    // that tells the two canvases apart.
+    panel.sock.send(helloFrame(TAB3));
+    await waitFor(() => expect(bridge.canReach(TAB3)).toBe(true));
+    let retryRid = "";
+    await bridge.send(
+      { cmd: "graph_move_node", node_id: 4, pos: [0, 0], retry_of: original },
+      {
+        tabId: TAB3,
+        timeoutMs: 5000,
+        onDispatchedRid: (rid) => {
+          retryRid = rid;
+        },
+      },
+    );
+    expect(bridge.markMutationReconciled(original, retryRid), "answered for another tab's canvas").toBe(false);
+    expect(bridge.mutationSettlement(original)).toBe("unknown");
+  });
+
+  it("a stray ack that the #2559 FIFO path hands to the retry's waiter does not prove the retry was answered", async () => {
+    __panelToolsTestHooks.setOutstandingMutationReadSettleMs(40);
+    const panel = await connected(); // no ledger: the retry is a fresh, held write
+    const first = await setWidget(slowWriteCtx(), SAVE_NODE, "filename_prefix", NEW.filename_prefix);
+    const token = tokenOf(first);
+    const retry = defByName("panel_set_widget").handler(
+      { node_id: SAVE_NODE, widget: "filename_prefix", value: NEW.filename_prefix, retry_of: token } as never,
+      slowWriteCtx(5000),
+    );
+    await panel.writesArrived(2);
+    // An ack under a rid nobody is waiting on, for the same node: the bridge hands it
+    // to the retry's pending waiter so that call is not stranded (#2559).
+    panel.sock.send(
+      JSON.stringify({
+        rid: "stray-ack-2955",
+        ok: true,
+        result: { set: { node_id: SAVE_NODE, widget: "filename_prefix", previous: OLD.filename_prefix, value: NEW.filename_prefix } },
+      }),
+    );
+    expect((await retry).isError).not.toBe(true);
+    expect(bridge.mutationSettlement(token), "a borrowed ack is not the retry's own answer").toBe("unknown");
+    expect((await panelRun(newCtx())).isError).toBe(true);
     expect(panel.runs).toHaveLength(0);
   });
 
