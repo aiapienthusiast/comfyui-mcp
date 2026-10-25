@@ -98,6 +98,9 @@ type SendCtx = {
   reject: (e: Error) => void;
   command: BridgeCommand;
   timeoutMs: number;
+  /** #2955 — who issued this send, read synchronously at send() entry (see
+   *  setMutationOwnership). Opaque to the bridge. */
+  owner?: unknown;
   tabId: string;
   /** True for anything that could have a side effect on the panel/ComfyUI (e.g.
    *  graph_run queues a real render). Mutating commands are NEVER auto-retried on
@@ -2676,6 +2679,9 @@ export class UiBridge {
    *  mid-command drop and a workflow replacement all leave it with the outcome
    *  unknown — so a run barrier reads settlement only from here. */
   private settledMutations = new Map<string, SettledMutation>();
+  /** #2955 — see setMutationOwnership. */
+  private mutationOwnerReader: (() => unknown) | null = null;
+  private ownedMutationObserver: ((rid: string, owner: unknown) => void) | null = null;
   /** #2955 — what bounded memory could not keep: unknown-outcome receipts evicted
    *  by TTL or capacity, compacted per (canonical tab, receiving browser document)
    *  plus one global overflow marker. A marker is cleared only by the late reply of
@@ -5155,6 +5161,22 @@ export class UiBridge {
     return out;
   }
 
+  /**
+   * #2955 — attribute delivered mutation receipts to whoever issued them.
+   * `reader` is called synchronously at the start of every send() and returns
+   * the issuer (or undefined); `observer` is told each recorded mutation
+   * receipt's rid with that issuer, right after the frame is written. panel-tools
+   * uses it so a run barrier knows exactly which receipts its snapshotted
+   * in-progress edit calls produced — whatever send path those calls took.
+   */
+  setMutationOwnership(
+    reader: (() => unknown) | null,
+    observer: ((rid: string, owner: unknown) => void) | null,
+  ): void {
+    this.mutationOwnerReader = reader;
+    this.ownedMutationObserver = observer;
+  }
+
   /** #2955 — the awaited subset of {@link listUnsettledMutations}. */
   listAwaitedMutations(tabId: string): DeliveredMutationReceipt[] {
     return this.listUnsettledMutations(tabId)
@@ -6435,6 +6457,9 @@ export class UiBridge {
       maxReconnectRetries?: number;
     } = {},
   ): Promise<unknown> {
+    // #2955 — the issuer, read at the synchronous start of send(), before any await
+    // or lane wait can change the ambient context. Opaque; see setMutationOwnership.
+    const owner = this.mutationOwnerReader?.();
     // #357: read (idempotent) ops get a more tolerant default so a busy-but-alive
     // panel main thread (e.g. Preview3D loading a large FBX) isn't declared frozen;
     // mutating ops keep the tight default. An explicit opts.timeoutMs always wins.
@@ -7062,6 +7087,7 @@ export class UiBridge {
           // frame, not read back later from `conns` (by resume time the key may be
           // held by somebody else, which is the whole point of storing it).
           issuedToTabSessionId: live.tabSessionId,
+          ...(owner !== undefined ? { owner } : {}),
           // #570 — graph ops resolve from the CALLER'S intended tab (opts.tabId), NOT
           // the canonical conn.tabId: after a same-socket switch the two differ, and
           // we must stamp the workflow the command was ISSUED FOR (so the panel, now
@@ -7367,6 +7393,15 @@ export class UiBridge {
       else delete frame.workflow_uuid;
       conn.sock.send(JSON.stringify(frame));
       this.rememberDeliveredMutation(rid, cmd.cmd, ctx.tabId, frame, conn.incarnationId);
+      // #2955 — tell the issuer which receipt its send became. Only a recorded
+      // mutation receipt (never a read, never a run) is reported.
+      if (ctx.owner !== undefined && cmd.cmd !== "graph_run" && this.deliveredMutations.has(rid)) {
+        try {
+          this.ownedMutationObserver?.(rid, ctx.owner);
+        } catch {
+          // an observer fault must not affect the dispatch
+        }
+      }
       try { ctx.onDispatchedRid?.(rid); } catch { /* observer faults are non-fatal */ }
     } catch (err) {
       clearTimeout(timer);

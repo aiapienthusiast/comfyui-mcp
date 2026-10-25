@@ -1694,6 +1694,129 @@ describe("settlement needs the write's OWN definite outcome — waiter completio
   }
 });
 
+describe("receipts dispatched by a snapshotted edit call AFTER the snapshot still need their own outcome (#2955)", () => {
+  const setResult = (nodeId: number, widget: keyof Widgets, value: string) => ({
+    set: { node_id: nodeId, widget, previous: OLD[widget], value },
+  });
+
+  async function preflightRun(panel: ScriptedPanel, ctx: PanelToolCtx) {
+    const barrier = observeBarrier();
+    const write = setWidget(ctx, SAVE_NODE, "filename_prefix", NEW.filename_prefix);
+    const run = tracked(panelRun(ctx));
+    const first = await firstOf(barrier, panel);
+    expect(first.kind).toBe("barrier");
+    // Caught in its preflight: one intent, and no receipt exists yet.
+    expect(first.kind === "barrier" && first.snapshot).toEqual({ intents: 1, awaited: 0, unknown: 0 });
+    await panel.writesArrived(1);
+    return { write, run, rid: panel.writes[0]?.msg.rid as string };
+  }
+
+  it("a preflight write later completed by a BORROWED ack: zero graph_run until its own definite reply", async () => {
+    __panelToolsTestHooks.setRunFreshnessBarrierMs(400);
+    const panel = await connected();
+    const ctx = newCtx();
+    const { write, run, rid } = await preflightRun(panel, ctx);
+
+    panel.sock.send(
+      JSON.stringify({ rid: "orphan-ack-2955-r6", ok: true, result: setResult(SAVE_NODE, "filename_prefix", NEW.filename_prefix) }),
+    );
+    const writeRes = await write;
+    expect(writeRes.isError, "the borrowed ack completes the setter without error").not.toBe(true);
+    expect(bridge.mutationSettlement(rid)).toBe("unknown");
+
+    const res = await run.promise;
+    expect(res.isError).toBe(true);
+    expect(textOf(res)).toContain(`that edit's own token retry_of:"${rid}"`);
+    expect(panel.runs, "graph_run must not overtake the still-held write").toHaveLength(0);
+    expect(panel.applyCount).toBe(0);
+
+    panel.writes[0]?.release(); // the write's OWN definite reply
+    await waitFor(() => expect(bridge.mutationSettlement(rid)).toBe("settled"));
+    const next = await panelRun(ctx);
+    expect(next.isError, textOf(next)).not.toBe(true);
+    expect(panel.runs).toHaveLength(1);
+    expect(panel.runs[0]?.serialized.filename_prefix).toBe(NEW.filename_prefix);
+  });
+
+  it("positive control: a borrowed ack, then the write's own reply inside the window — the run waits and includes it", async () => {
+    __panelToolsTestHooks.setRunFreshnessBarrierMs(5_000);
+    const panel = await connected();
+    const ctx = newCtx();
+    const { write, run, rid } = await preflightRun(panel, ctx);
+
+    panel.sock.send(
+      JSON.stringify({ rid: "orphan-ack-2955-r6b", ok: true, result: setResult(SAVE_NODE, "filename_prefix", NEW.filename_prefix) }),
+    );
+    expect((await write).isError).not.toBe(true);
+    expect(run.settled(), "still waiting on the write's own outcome").toBe(false);
+    expect(panel.runs).toHaveLength(0);
+    panel.writes[0]?.release();
+
+    const res = await run.promise;
+    expect(res.isError, textOf(res)).not.toBe(true);
+    expect(bridge.mutationSettlement(rid)).toBe("settled");
+    expect(panel.runs).toHaveLength(1);
+    expect(panel.runs[0]?.serialized.filename_prefix).toBe(NEW.filename_prefix);
+  });
+
+  it('a preflight write answered under its OWN rid with applied:"unknown": zero graph_run until a definite reply', async () => {
+    __panelToolsTestHooks.setRunFreshnessBarrierMs(400);
+    const panel = await connected();
+    const ctx = newCtx();
+    const { write, run, rid } = await preflightRun(panel, ctx);
+
+    panel.sock.send(
+      JSON.stringify({
+        rid,
+        ok: true,
+        result: { applied: "unknown", ...setResult(SAVE_NODE, "filename_prefix", NEW.filename_prefix) },
+      }),
+    );
+    await write;
+    expect(bridge.mutationSettlement(rid)).toBe("unknown");
+    const res = await run.promise;
+    expect(res.isError).toBe(true);
+    expect(textOf(res)).toContain(`retry_of:"${rid}"`);
+    expect(panel.runs).toHaveLength(0);
+
+    panel.sock.send(
+      JSON.stringify({ rid, ok: true, result: { applied: true, ...setResult(SAVE_NODE, "filename_prefix", NEW.filename_prefix) } }),
+    );
+    await waitFor(() => expect(bridge.mutationSettlement(rid)).toBe("settled"));
+    const next = await panelRun(ctx);
+    expect(next.isError, textOf(next)).not.toBe(true);
+    expect(panel.runs).toHaveLength(1);
+  });
+
+  it("two edit calls on ONE session: each receipt is attributed to the call that sent it", async () => {
+    __panelToolsTestHooks.setRunFreshnessBarrierMs(400);
+    const panel = await connected();
+    const ctx = newCtx();
+    const barrier = observeBarrier();
+    const prefix = setWidget(ctx, SAVE_NODE, "filename_prefix", NEW.filename_prefix);
+    const text = setWidget(ctx, PROMPT_NODE, "text", NEW.text);
+    const run = tracked(panelRun(ctx));
+    const first = await firstOf(barrier, panel);
+    expect(first.kind === "barrier" && first.snapshot).toEqual({ intents: 2, awaited: 0, unknown: 0 });
+    await panel.writesArrived(2);
+    const ridOf = (widget: string) => panel.writes.find((w) => w.msg.widget === widget)?.msg.rid as string;
+    const prefixRid = ridOf("filename_prefix");
+    const textRid = ridOf("text");
+
+    // The prefix write gets its own definite reply; the text write only a borrowed ack.
+    panel.writes.find((w) => w.msg.rid === prefixRid)?.release();
+    panel.sock.send(JSON.stringify({ rid: "orphan-ack-2955-r6c", ok: true, result: setResult(PROMPT_NODE, "text", NEW.text) }));
+    expect((await prefix).isError).not.toBe(true);
+    expect((await text).isError).not.toBe(true);
+
+    const res = await run.promise;
+    expect(res.isError).toBe(true);
+    expect(textOf(res)).toContain(`retry_of:"${textRid}"`);
+    expect(textOf(res), "the settled write is not reported as open").not.toContain(prefixRid);
+    expect(panel.runs).toHaveLength(0);
+  });
+});
+
 describe("panel_run observes earlier acknowledged mutations before serialization (#2955) — concurrency", () => {
   it("concurrent runs do not wait on each other's graph_run acknowledgement", async () => {
     const sock = await connectPanel();

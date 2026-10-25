@@ -23,6 +23,7 @@
 // gating for panel_clear/panel_restart_comfyui) is IDENTICAL across providers,
 // so parity is automatic — neither path reimplements a tool.
 
+import { AsyncLocalStorage } from "node:async_hooks";
 import { z } from "zod";
 import { createHash, randomUUID } from "node:crypto";
 // #873 — the operator's tool-surface policy also governs the panel surface.
@@ -20916,12 +20917,55 @@ function withRetryToken(d: PanelToolDef): PanelToolDef {
  * (graph_get_subgraph / graph_query / graph_outline) that runs BEFORE its write
  * frame is sent — a window no bridge receipt can see. `failed` records how the
  * call ENDED (an error result or a throw), because a run that depended on an
- * edit must not treat "the call returned" as "the edit applied".
+ * edit must not treat "the call returned" as "the edit applied". `rids` are the
+ * mutation receipts the call itself dispatched (bounded; `ridOverflow` past the
+ * bound): a call that finishes without error has only proved its waiter
+ * completed — each of its receipts still needs its own definite outcome.
  */
-type MutationIntent = { tool: string; finished: boolean; failed: boolean; done: Promise<void> };
+type MutationIntent = {
+  tool: string;
+  finished: boolean;
+  failed: boolean;
+  done: Promise<void>;
+  rids: Set<string>;
+  ridOverflow: boolean;
+};
 
 /** Keyed by the session's ctx: one agent's overlapping calls share it. */
 const mutationIntents = new WeakMap<PanelToolCtx, Set<MutationIntent>>();
+
+/**
+ * #2955 — the intent a send() belongs to, carried by async context rather than by
+ * a delegating ctx: the handler keeps the session ctx itself (so a rebind or any
+ * ctx-keyed state behaves exactly as before), and two edit calls running at once
+ * on ONE ctx still get their own receipts. The bridge reads it synchronously at
+ * send() entry (setMutationOwnership) — every send path, ctx.call or a direct
+ * ctx.bridge.send, is covered.
+ */
+const intentScope = new AsyncLocalStorage<MutationIntent>();
+const liveIntentObjects = new WeakSet<MutationIntent>();
+const MAX_INTENT_RECEIPTS = 64;
+const intentTrackedBridges = new WeakSet<object>();
+
+function ensureIntentReceiptTracking(bridge: PanelToolCtx["bridge"]): void {
+  if (!bridge || typeof bridge.setMutationOwnership !== "function") return;
+  if (intentTrackedBridges.has(bridge)) return;
+  intentTrackedBridges.add(bridge);
+  bridge.setMutationOwnership(
+    () => intentScope.getStore(),
+    (rid, owner) => {
+      if (!owner || typeof owner !== "object" || !liveIntentObjects.has(owner as MutationIntent)) return;
+      const intent = owner as MutationIntent;
+      // Only while the call is running: nothing may grow a finished intent.
+      if (intent.finished) return;
+      if (intent.rids.size >= MAX_INTENT_RECEIPTS) {
+        intent.ridOverflow = true;
+        return;
+      }
+      intent.rids.add(rid);
+    },
+  );
+}
 
 function withMutationIntent(d: PanelToolDef): PanelToolDef {
   return {
@@ -20935,7 +20979,11 @@ function withMutationIntent(d: PanelToolDef): PanelToolDef {
         done: new Promise<void>((resolve) => {
           finish = resolve;
         }),
+        rids: new Set<string>(),
+        ridOverflow: false,
       };
+      liveIntentObjects.add(intent);
+      ensureIntentReceiptTracking(ctx.bridge);
       let live = mutationIntents.get(ctx);
       if (!live) {
         live = new Set();
@@ -20943,7 +20991,7 @@ function withMutationIntent(d: PanelToolDef): PanelToolDef {
       }
       live.add(intent);
       try {
-        const res = await d.handler(args, ctx);
+        const res = await intentScope.run(intent, () => d.handler(args, ctx));
         intent.failed = res.isError === true;
         return res;
       } finally {
@@ -20955,7 +21003,7 @@ function withMutationIntent(d: PanelToolDef): PanelToolDef {
   };
 }
 
-function describeDeliveredEdit(m: DeliveredMutationReceipt): string {
+function describeDeliveredEdit(m: Pick<DeliveredMutationReceipt, "cmd" | "frame">): string {
   const node = m.frame.node_id !== undefined ? ` node ${String(m.frame.node_id)}` : "";
   const widget = typeof m.frame.widget === "string" ? ` widget "${m.frame.widget}"` : "";
   return `"${m.cmd}"${node}${widget}`;
@@ -21199,6 +21247,7 @@ function withRunFreshnessBarrier(d: PanelToolDef): PanelToolDef {
         intents.length > 0 || awaiting.length > 0
           ? runFreshnessBarrierMs()
           : outstandingMutationReadSettleMs();
+      const waitStartedAt = Date.now();
       await settleWithin(
         Promise.all([
           Promise.all(intents.map((intent) => intent.done)),
@@ -21211,6 +21260,20 @@ function withRunFreshnessBarrier(d: PanelToolDef): PanelToolDef {
         ]),
         budgetMs,
       );
+      // #2955 — the receipts the SNAPSHOTTED edit calls dispatched, including those
+      // sent after the snapshot (an intent caught in its preflight had none yet).
+      // Each needs its own definite outcome: a call that returned without error
+      // may only have had its waiter completed (a #2559 borrowed ack) or been told
+      // applied:"unknown". Receipts of edits issued AFTER the run started are not
+      // here — the run's ordering contract is unchanged.
+      const snapshotRids = new Set(edits.map((m) => m.rid));
+      const owned = [...new Set(intents.flatMap((intent) => [...intent.rids]))].filter(
+        (rid) => !snapshotRids.has(rid),
+      );
+      if (owned.length && typeof bridge.waitForMutationSettlement === "function") {
+        const remaining = Math.max(0, waitStartedAt + budgetMs - Date.now());
+        await settleWithin(bridge.waitForMutationSettlement(owned, remaining), remaining);
+      }
 
       const drift = runTargetDrift(before, captureRunTargetWitness(ctx));
       if (drift) {
@@ -21231,9 +21294,32 @@ function withRunFreshnessBarrier(d: PanelToolDef): PanelToolDef {
           .filter((m) => settlementOf(m.rid) === "awaiting")
           .map((m) => `${describeDeliveredEdit(m)} (delivered, awaiting the panel's reply)`),
       ];
-      const unknown = edits.filter((m) => settlementOf(m.rid) === "unknown");
+      const ownedOpen = owned
+        .map((rid) => {
+          const peek = typeof bridge.peekDeliveredMutation === "function" ? bridge.peekDeliveredMutation(rid) : undefined;
+          return { rid, cmd: peek?.cmd ?? "graph mutation", frame: peek?.frame ?? {}, settlement: settlementOf(rid) };
+        })
+        .filter((m) => m.settlement !== "settled");
+      for (const m of ownedOpen) {
+        if (m.settlement === "awaiting") {
+          unfinished.push(`${describeDeliveredEdit(m)} (dispatched by that call, awaiting the panel's reply)`);
+        }
+      }
+      const unknown: Array<{ rid: string; cmd: string; frame: Record<string, unknown> }> = [
+        ...edits.filter((m) => settlementOf(m.rid) === "unknown"),
+        ...ownedOpen.filter((m) => m.settlement === "unknown"),
+      ];
       const failed = intents.filter((intent) => intent.finished && intent.failed);
       const reasons: string[] = [];
+      const overflowed = intents.filter((intent) => intent.ridOverflow);
+      if (overflowed.length) {
+        reasons.push(
+          `${overflowed.map((intent) => intent.tool).join(", ")} dispatched more than ` +
+            `${MAX_INTENT_RECEIPTS} graph edits, more than this run can track individually, so it ` +
+            `cannot prove they all settled. Read the canvas with panel_query_graph, then call ` +
+            `panel_run again on its own.`,
+        );
+      }
       if (failed.length) {
         reasons.push(
           `${failed.length} graph edit call(s) issued before this run FAILED: ` +
@@ -21255,8 +21341,9 @@ function withRunFreshnessBarrier(d: PanelToolDef): PanelToolDef {
       if (unknown.length) {
         reasons.push(
           `${unknown.length} earlier graph edit(s) on this canvas have an UNKNOWN outcome — ` +
-            `delivered, but the reply timed out, the connection dropped, or the workflow was ` +
-            `replaced before the panel answered: ` +
+            `delivered, but the reply timed out, the connection dropped, the workflow was ` +
+            `replaced, or the panel's answer did not settle it (an acknowledgement borrowed from ` +
+            `another request, or an explicit unknown outcome): ` +
             unknown
               .map(
                 (m) =>
