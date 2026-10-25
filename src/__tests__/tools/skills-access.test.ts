@@ -545,6 +545,39 @@ describe("actions call the same services with the same arguments", () => {
     expect(out).not.toContain("Not found in ComfyUI-Manager");
   });
 
+  it('action:"extract_deps" does not call an all-ambiguous workflow "all built-in"', async () => {
+    mocks.extractWorkflowDependencies.mockResolvedValueOnce({
+      classTypes: ["ShowText"],
+      requiredPacks: [],
+      missingPacks: [],
+      unresolved: ["ShowText"],
+      ambiguous: [{ class_type: "ShowText", claimants: ["a", "b"] }],
+      dependencies: [
+        { class_type: "ShowText", pack: null, builtin: false, installed: false, source: "unresolved", claimants: ["a", "b"] },
+      ],
+    });
+    const out = text(await handler()({ action: "extract_deps", workflow: { "1": { class_type: "ShowText", inputs: {} } } }));
+    expect(out).not.toContain("core/built-in");
+    expect(out).toContain("No custom node pack ownership was resolved");
+  });
+
+  it('action:"install_deps" says nothing was queued, lists refused targets apart from "not found"', async () => {
+    mocks.installWorkflowDependencies.mockResolvedValueOnce({
+      installed: [],
+      alreadyInstalled: [],
+      unresolved: ["Mystery", "https://github.com/x/pack"],
+      target_refusals: [{ pack: "https://github.com/x/pack", reason: "known only by its repository URL" }],
+    });
+    const out = text(await handler()({ action: "install_deps", workflow: { "1": { class_type: "X", inputs: {} } } }));
+    expect(out).toContain("## No packs were queued");
+    expect(out).not.toContain("No packs needed installation");
+    expect(out).toContain("### Not queued: install target not established (1)");
+    expect(out).toContain("- https://github.com/x/pack: known only by its repository URL");
+    const notFound = out.slice(out.indexOf("### Could not resolve"));
+    expect(notFound).toContain("### Could not resolve (1)");
+    expect(notFound).not.toContain("https://github.com/x/pack");
+  });
+
   it('action:"generate_skill" forwards source + refresh and keeps structuredContent', async () => {
     mocks.generateSkillCached.mockResolvedValueOnce({
       markdown: "# SKILL",

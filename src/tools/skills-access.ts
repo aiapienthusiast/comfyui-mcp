@@ -982,7 +982,13 @@ async function extractDepsAction(input: string | Record<string, unknown>): Promi
   lines.push(`## Workflow dependencies (${result.classTypes.length} node type(s))`, "");
 
   if (result.requiredPacks.length === 0) {
-    lines.push("All node types are core/built-in ComfyUI nodes. No custom node packs required.");
+    // #2765 — an empty pack list also follows from every claim being refused; only an
+    // all-builtin workflow may say "built-in".
+    lines.push(
+      result.dependencies.every((d) => d.builtin)
+        ? "All node types are core/built-in ComfyUI nodes. No custom node packs required."
+        : "No custom node pack ownership was resolved for this workflow — see the ambiguous / unresolved node types below.",
+    );
   } else {
     lines.push(`### Required custom node packs (${result.requiredPacks.length})`);
     for (const pack of result.requiredPacks) {
@@ -1080,7 +1086,8 @@ async function installDepsAction(input: string | Record<string, unknown>): Promi
       "",
     );
   } else {
-    lines.push("## No packs needed installation", "");
+    // #2765 — "needed" is only true when nothing was left unresolved.
+    lines.push(result.unresolved.length > 0 ? "## No packs were queued" : "## No packs needed installation", "");
   }
 
   if (result.alreadyInstalled.length > 0) {
@@ -1102,7 +1109,15 @@ async function installDepsAction(input: string | Record<string, unknown>): Promi
     if (result.catalogue_currency_unverified)
       lines.push(result.catalogue_currency_unverified, "");
     lines.push(...ambiguousOwnershipLines(result.ambiguous));
-    const unknown = withoutAmbiguous(result.unresolved, result.ambiguous);
+    const refused = new Set((result.target_refusals ?? []).map((r) => r.pack));
+    if (refused.size > 0) {
+      lines.push(
+        `### Not queued: install target not established (${refused.size})`,
+        ...(result.target_refusals ?? []).map((r) => `- ${r.pack}: ${r.reason}`),
+        "",
+      );
+    }
+    const unknown = withoutAmbiguous(result.unresolved, result.ambiguous).filter((p) => !refused.has(p));
     if (unknown.length > 0) {
       lines.push(
         `### Could not resolve (${unknown.length})`,

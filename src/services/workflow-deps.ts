@@ -78,6 +78,12 @@ export interface NodeDependency {
    */
   source: "object_info" | "manager_mappings" | "manager_pattern" | "unresolved";
   /**
+   * #2765 — the catalogue key (repository URL or registry id) the Manager resolution
+   * named. This, not `pack` (a display name), is what install_deps binds the install to.
+   * Absent when ownership came from /object_info or was not resolved.
+   */
+  repository?: string;
+  /**
    * #2765 — set when the catalogue names more than one repository for this class and
    * nothing here can tell which is right. `pack` is then null: picking one would be a guess.
    */
@@ -135,6 +141,8 @@ export interface InstallDepsResult {
   unresolved: string[];
   /** #2765 — the analysis's `ambiguous`, carried through: claimed by several repositories, so not queued. */
   ambiguous?: AmbiguousOwnership[];
+  /** #2765 — missing packs (also in `unresolved`) that were not bound to exactly one install target, and why. */
+  target_refusals?: Array<{ pack: string; reason: string }>;
   /** Queue status after processing, if available. */
   queue?: ManagerQueueStatus;
   /**
@@ -351,30 +359,80 @@ function packFromPythonModule(pythonModule: string | undefined): {
 
 /**
  * #2765 — a `nodename_pattern` is a naming convention a pack publishes, not an ownership
- * record: anyone may publish one about anyone. A pattern that matches this string
- * constrains nothing (`.*`, `^`, `.?`) and so attributes nothing. One catalogue entry
- * published `.*` with no listed classes and was named the owner of every class the
- * catalogue did not list.
+ * record: anyone may publish one about anyone. One catalogue entry published `.*` with no
+ * listed classes and was named the owner of every class the catalogue did not list.
+ *
+ * A pattern is discarded when it visibly constrains nothing: it has no literal letter or
+ * digit outside character classes and escapes (`.*`, `^[^\x00]+$`, `\w+`), or it matches
+ * one of these generic probes (`Foo|.*`, `(?:Foo)?`). This is a HEURISTIC that removes the
+ * forms known to attribute everything; passing it proves nothing about ownership. What
+ * stops a surviving pattern naming an owner wrongly is resolveFromMappings: it names one
+ * only when no other repository claims the class at all.
  */
-const CATCH_ALL_PROBE = "\u0000comfyui-mcp:no-pack-names-this\u0000";
+const GENERIC_PROBES = ["", "\u0000comfyui-mcp:no-pack-names-this\u0000", "x", "KSampler", "Load Image", "ノード"];
+
+/** True when `source` has a literal letter/digit outside character classes, class escapes and group syntax. */
+function hasLiteralWord(source: string): boolean {
+  let literal = "";
+  for (let i = 0; i < source.length; i++) {
+    const c = source[i];
+    if (c === "\\") {
+      const n = source[i + 1] ?? "";
+      if ((n === "p" || n === "P") && source[i + 2] === "{") {
+        i = source.indexOf("}", i);
+        if (i < 0) return false;
+      } else if (n === "k" && source[i + 2] === "<") {
+        i = source.indexOf(">", i);
+        if (i < 0) return false;
+      } else if (n === "x") i += 3;
+      else if (n === "u") i += 5;
+      else if (n === "c") i += 2;
+      else if (/[dDwWsSbBnrtfv0-9]/.test(n)) i += 1;
+      else {
+        literal += n;
+        i += 1;
+      }
+    } else if (c === "[") {
+      // Skip the whole class, honouring escapes inside it.
+      for (i++; i < source.length && source[i] !== "]"; i++) if (source[i] === "\\") i++;
+    } else if (c === "(" && source[i + 1] === "?") {
+      // (?: (?= (?! (?<= (?<! and (?<name> — group syntax, not content.
+      if (source[i + 2] === "<" && source[i + 3] !== "=" && source[i + 3] !== "!") {
+        i = source.indexOf(">", i);
+        if (i < 0) return false;
+      } else i += source[i + 2] === "<" ? 3 : 2;
+    } else if (c === "{" && /^\{\d*,?\d*\}/.test(source.slice(i))) {
+      i = source.indexOf("}", i);
+    } else literal += c;
+  }
+  return /[\p{L}\p{N}]/u.test(literal);
+}
+
+function constrainsNothing(re: RegExp): boolean {
+  return !hasLiteralWord(re.source) || GENERIC_PROBES.some((probe) => re.test(probe));
+}
 
 /** Class_type -> claimant lookup from Manager mappings, keyed by catalogue key (repo URL or registry id). */
 interface MappingIndex {
   /** class_type -> every catalogue key that LISTS it. */
   exact: Map<string, Set<string>>;
   patterns: Array<{ re: RegExp; repo: string; overBroad?: boolean }>;
-  /** catalogue key -> the pack name this module reports (Manager title, else the key). */
+  /**
+   * catalogue key -> the pack name this module reports: the Manager title when no other
+   * entry shares it or uses it as a key, otherwise the key itself, so two repositories
+   * are never reported (or installed) under one name.
+   */
   names: Map<string, string>;
 }
 
 function buildMappingIndex(mappings: ManagerMappings): MappingIndex {
   const exact = new Map<string, Set<string>>();
   const patterns: MappingIndex["patterns"] = [];
-  const names = new Map<string, string>();
+  const titles = new Map<string, string>();
   for (const [repoOrId, value] of Object.entries(mappings)) {
     if (!Array.isArray(value)) continue;
     const [classNames, meta] = value;
-    names.set(repoOrId, (meta && meta.title) || repoOrId);
+    titles.set(repoOrId, (meta && meta.title) || repoOrId);
     if (Array.isArray(classNames)) {
       for (const cn of classNames) {
         if (typeof cn !== "string") continue;
@@ -392,44 +450,41 @@ function buildMappingIndex(mappings: ManagerMappings): MappingIndex {
         // Ignore malformed patterns from the Manager DB.
         continue;
       }
-      if (!re.test(CATCH_ALL_PROBE)) patterns.push({ re, repo: repoOrId });
+      if (!constrainsNothing(re)) patterns.push({ re, repo: repoOrId });
     }
   }
+  const uses = new Map<string, number>();
+  for (const [key, title] of titles) {
+    uses.set(title, (uses.get(title) ?? 0) + 1);
+    if (title !== key) uses.set(key, (uses.get(key) ?? 0) + 1);
+  }
+  const names = new Map<string, string>();
+  for (const [key, title] of titles) names.set(key, uses.get(title) === 1 ? title : key);
   return { exact, patterns, names };
 }
 
 /**
  * Manager applies patterns as a SEARCH (`regex.test` in its missing-node finder,
  * `re.search` in its workflow scan), so `" \(rgthree\)$"` stays a suffix convention.
- * What bounds a pattern is the catalogue itself: one matching classes that two or more
- * OTHER repositories list is demonstrably not one pack's convention (`Hunyuan` matched
- * 185 classes of 45 other packs). A single collision does not discard it — that is two
- * sources disagreeing, and resolveFromMappings reports it as ambiguous instead.
- * Computed lazily: only patterns that match a workflow class are ever measured.
+ *
+ * HEURISTIC, not an ownership proof: a pattern matching classes that two or more OTHER
+ * repositories list is treated as too broad to be one pack's convention and contributes
+ * no claim (`Hunyuan` matched 185 classes of 45 other packs). A pattern with a single
+ * foreign collision is kept, so that collision surfaces as ambiguity in
+ * resolveFromMappings instead of being settled here. A class the pattern's own
+ * repository also lists still counts: co-listing does not make the other listers less
+ * foreign. Computed lazily: only patterns that match a workflow class are measured.
  */
 function isOverBroad(p: MappingIndex["patterns"][number], index: MappingIndex): boolean {
   if (p.overBroad !== undefined) return p.overBroad;
   const foreign = new Set<string>();
   for (const [cn, owners] of index.exact) {
-    if (owners.has(p.repo) || !p.re.test(cn)) continue;
-    for (const o of owners) foreign.add(o);
+    if (!p.re.test(cn)) continue;
+    for (const o of owners) if (o !== p.repo) foreign.add(o);
     if (foreign.size >= 2) break;
   }
   p.overBroad = foreign.size >= 2;
   return p.overBroad;
-}
-
-/** Every repository the catalogue offers for a class: by listing, and by bounded pattern. */
-function catalogueClaims(
-  classType: string,
-  index: MappingIndex,
-): { listed: Set<string>; matched: Set<string> } {
-  const listed = index.exact.get(classType) ?? new Set<string>();
-  const matched = new Set<string>();
-  for (const p of index.patterns) {
-    if (p.re.test(classType) && !isOverBroad(p, index)) matched.add(p.repo);
-  }
-  return { listed, matched };
 }
 
 type MappingResolution =
@@ -438,44 +493,22 @@ type MappingResolution =
   | { kind: "ambiguous"; claimants: string[] };
 
 /**
- * #2765 — name an owner only when the catalogue names exactly one. A listing outranks a
- * convention, unless the convention comes from a repository that lists nothing here,
- * which is two sources disagreeing. A pattern a second pack copied (`- Ostris$`, `_jru$`)
- * is not independent when one of the listers publishes it too. Never first-wins.
+ * #2765 — name an owner only when exactly one repository claims the class, counting every
+ * listing and every retained pattern. Any second claimant, listed or pattern-only, with
+ * an identical pattern or a different one, makes the result ambiguous: nothing here can
+ * tell which claim is right, and a repository adding a pattern that matches its own
+ * listing is not independent evidence. Never first-wins; independent of catalogue order.
  */
 function resolveFromMappings(classType: string, index: MappingIndex): MappingResolution {
-  const { listed, matched } = catalogueClaims(classType, index);
-  const corroborated = [...matched].some((r) => listed.has(r));
-  if (listed.size > 0) {
-    const dissent = corroborated ? [] : [...matched];
-    const claimants = [...new Set([...listed, ...dissent])].sort();
-    return claimants.length === 1
-      ? { kind: "owner", repo: claimants[0], via: "exact" }
-      : { kind: "ambiguous", claimants };
+  const listed = index.exact.get(classType) ?? new Set<string>();
+  const claimants = new Set(listed);
+  for (const p of index.patterns) {
+    if (p.re.test(classType) && !isOverBroad(p, index)) claimants.add(p.repo);
   }
-  const claimants = [...matched].sort();
-  if (claimants.length === 0) return { kind: "none" };
-  return claimants.length === 1
-    ? { kind: "owner", repo: claimants[0], via: "pattern" }
-    : { kind: "ambiguous", claimants };
-}
-
-/** Directory-name form of a catalogue key (repo URL or registry id). */
-function dirKey(key: string): string {
-  const seg = key.replace(/\/+$/, "").replace(/\.git$/i, "").split("/").pop() ?? "";
-  return seg.toLowerCase().replace(/_/g, "-");
-}
-
-/**
- * #2765 — an installed node is owned by the directory it loaded from; that is the one
- * fact the catalogue cannot launder (Manager's getmappings appends installed-but-unlisted
- * classes to every pack whose pattern matches them). Manager's friendlier title is kept
- * only when exactly one claimant IS that directory.
- */
-function nameForInstalledDir(classType: string, packDir: string, index: MappingIndex): string {
-  const { listed, matched } = catalogueClaims(classType, index);
-  const same = [...new Set([...listed, ...matched])].filter((r) => dirKey(r) === dirKey(packDir));
-  return same.length === 1 ? (index.names.get(same[0]) ?? packDir) : packDir;
+  const sorted = [...claimants].sort();
+  if (sorted.length === 0) return { kind: "none" };
+  if (sorted.length > 1) return { kind: "ambiguous", claimants: sorted };
+  return { kind: "owner", repo: sorted[0], via: listed.has(sorted[0]) ? "exact" : "pattern" };
 }
 
 /**
@@ -544,9 +577,13 @@ export async function extractWorkflowDependencies(
         continue;
       }
       if (pack) {
+        // #2765 — the directory the node loaded from is what /object_info proves, and the
+        // one fact the catalogue cannot launder (Manager's getmappings appends installed-
+        // but-unlisted classes to every pack whose pattern matches them). It names a
+        // directory, not a repository, so no catalogue entry is bound to it here.
         dependencies.push({
           class_type: classType,
-          pack: nameForInstalledDir(classType, pack, mappingIndex),
+          pack,
           builtin: false,
           installed: true,
           source: "object_info",
@@ -568,6 +605,7 @@ export async function extractWorkflowDependencies(
         resolution.kind === "owner"
           ? resolution.via === "exact" ? "manager_mappings" : "manager_pattern"
           : fallback,
+      ...(resolution.kind === "owner" ? { repository: resolution.repo } : {}),
       ...(resolution.kind === "ambiguous" ? { claimants: resolution.claimants } : {}),
     });
   }
@@ -653,13 +691,31 @@ export async function installWorkflowDependencies(
   // true: a one-off assert here would reopen the same check-then-queue race the
   // generic mutation services fixed. Non-panel workflows intentionally do not
   // take this lock, so ordinary dependency installs do not contend with pins.
-  const panelTarget = analysis.missingPacks.find(targetsPanelPackExactly);
+  const panelTarget =
+    analysis.missingPacks.find(targetsPanelPackExactly) ??
+    [...missingPackRepositories(analysis).values()].flat().find(targetsPanelPackExactly);
   if (panelTarget) {
     return withPanelPinGuard("install workflow dependencies including", panelTarget, () =>
       installWorkflowDependenciesForAnalysis(analysis, deps),
     );
   }
   return installWorkflowDependenciesForAnalysis(analysis, deps);
+}
+
+/** #2765 — missing pack name -> the distinct catalogue keys the analysis resolved it to. */
+function missingPackRepositories(analysis: ExtractDepsResult): Map<string, string[]> {
+  const byPack = new Map<string, Set<string>>();
+  for (const dep of analysis.dependencies) {
+    if (dep.installed || !dep.pack || !dep.repository) continue;
+    const repos = byPack.get(dep.pack) ?? new Set<string>();
+    repos.add(dep.repository);
+    byPack.set(dep.pack, repos);
+  }
+  return new Map([...byPack].map(([pack, repos]) => [pack, [...repos].sort()]));
+}
+
+function isRepositoryUrl(key: string): boolean {
+  return /^[a-z][a-z0-9+.-]*:\/\//i.test(key) || key.startsWith("git@");
 }
 
 export async function installWorkflowDependenciesForAnalysis(
@@ -689,12 +745,7 @@ export async function installWorkflowDependenciesForAnalysis(
   // it is blocked; we know the catalogue is empty and that this is not the
   // same fact as absence.
   const catalogueEmpty = !directInstall && channel !== "local" && packs.length === 0;
-  const byKey = new Map<string, ManagerNodePack>();
-  for (const p of packs) {
-    for (const key of [p.id, p.title, p.reference]) {
-      if (key && !byKey.has(key)) byKey.set(key, p);
-    }
-  }
+  const targets = missingPackRepositories(analysis);
 
   const toInstall: ManagerNodePack[] = [];
   const installed: string[] = [];
@@ -706,26 +757,55 @@ export async function installWorkflowDependenciesForAnalysis(
   // unresolved and require install_comfyui(action:'panel') on the selected ComfyUI host instead.
   const panelTargets: string[] = [];
   const panelNotes: string[] = [];
+  const targetRefusals: Array<{ pack: string; reason: string }> = [];
   for (const pack of analysis.missingPacks) {
-    if (targetsPanelPackExactly(pack)) {
+    const repos = targets.get(pack) ?? [];
+    if (targetsPanelPackExactly(pack) || repos.some(targetsPanelPackExactly)) {
       panelTargets.push(pack);
       unresolved.push(pack);
       continue;
     }
-    const entry = byKey.get(pack);
-    if (!entry) {
-      // Manager v4 removed the legacy getlist catalog endpoint. Its task API
-      // resolves a registry/repository id directly, so an empty catalog is the
-      // v4 signal to enqueue that id rather than falsely claim it is unresolved.
-      if (directInstall) {
-        toInstall.push({ id: pack, version: "latest" });
-        installed.push(pack);
-        continue;
-      }
+    // #2765 — install exactly the repository the analysis resolved. `pack` is a display
+    // name; looking it up by name let a different entry sharing that title (or using it
+    // as an id) be queued instead, first one wins.
+    if (repos.length !== 1) {
       unresolved.push(pack);
+      targetRefusals.push({
+        pack,
+        reason:
+          repos.length === 0
+            ? "no resolved repository identity, so it was not queued"
+            : `resolved to several repositories (${repos.join(", ")}), so none was queued`,
+      });
       continue;
     }
-    toInstall.push(entry);
+    const [repo] = repos;
+    if (directInstall) {
+      // Manager v4 removed the legacy getlist catalog endpoint; its task API resolves a
+      // registry id directly. A full git URL is not one — v4 looks it up, matches
+      // nothing and marks the task done — so a URL-keyed pack is left unresolved.
+      if (isRepositoryUrl(repo)) {
+        unresolved.push(pack);
+        targetRefusals.push({
+          pack,
+          reason:
+            `known only by its repository URL (${repo}); Manager v4 installs by registry id, so it was ` +
+            `not queued. Install it from that repository instead`,
+        });
+        continue;
+      }
+      toInstall.push({ id: repo, version: "latest" });
+      installed.push(pack);
+      continue;
+    }
+    const matches = packs.filter((p) => p.id === repo || p.reference === repo || (p.files ?? []).includes(repo));
+    if (matches.length !== 1) {
+      unresolved.push(pack);
+      if (matches.length > 1)
+        targetRefusals.push({ pack, reason: `${repo} matches ${matches.length} Manager list entries, so none was queued` });
+      continue;
+    }
+    if (!toInstall.includes(matches[0])) toInstall.push(matches[0]);
     installed.push(pack);
   }
 
@@ -795,5 +875,6 @@ export async function installWorkflowDependenciesForAnalysis(
       ? { mappings_unavailable: analysis.mappings_unavailable }
       : {}),
     ...(panelNotes.length ? { panel_notes: panelNotes } : {}),
+    ...(targetRefusals.length ? { target_refusals: targetRefusals } : {}),
   };
 }

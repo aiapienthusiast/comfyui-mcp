@@ -2,6 +2,8 @@ import { describe, expect, it, vi } from "vitest";
 import {
   extractWorkflowDependencies,
   installWorkflowDependencies,
+  installWorkflowDependenciesForAnalysis,
+  type ManagerNodePack,
   type NodeDependency,
   type WorkflowDepsDeps,
 } from "../../services/workflow-deps.js";
@@ -112,6 +114,11 @@ function byType(deps: NodeDependency[]): Record<string, NodeDependency> {
   return Object.fromEntries(deps.map((d) => [d.class_type, d]));
 }
 
+/** The same catalogue with its keys in the opposite order: no answer may depend on order. */
+function reversed(m: Mappings): Mappings {
+  return Object.fromEntries(Object.entries(m).reverse());
+}
+
 describe("#2765 issue-era catalogue: a catch-all pattern owns nothing", () => {
   it("resolves the reported nodes to their naming-convention owners, not the catch-all", async () => {
     const result = await extractWorkflowDependencies(wf(...REPORTED), deps(ISSUE_ERA));
@@ -162,11 +169,12 @@ describe("#2765 issue-era catalogue: a catch-all pattern owns nothing", () => {
     const result = await extractWorkflowDependencies(wf(...REPORTED), deps(ISSUE_ERA, objectInfo));
     const d = byType(result.dependencies);
 
-    // The Manager title is kept only where the loaded directory corroborates it.
-    expect(d["Power Lora Loader (rgthree)"]).toMatchObject({ pack: "Comfy Nodes", installed: true, source: "object_info" });
-    expect(d["Switch latent [Crystools]"]).toMatchObject({ pack: "Crystools", installed: true, source: "object_info" });
+    // The loaded directory, verbatim: /object_info names a directory, not a repository.
+    expect(d["Power Lora Loader (rgthree)"]).toMatchObject({ pack: "rgthree-comfy", installed: true, source: "object_info" });
+    expect(d["Switch latent [Crystools]"]).toMatchObject({ pack: "ComfyUI-Crystools", installed: true, source: "object_info" });
     expect(d["Krea2EditGroundedEncode"]).toMatchObject({ pack: "comfyui-krea2edit", source: "object_info" });
-    expect(result.requiredPacks).toEqual(["Comfy Nodes", "Crystools", "comfyui-krea2edit"]);
+    for (const dep of result.dependencies) expect(dep.repository).toBeUndefined();
+    expect(result.requiredPacks).toEqual(["ComfyUI-Crystools", "comfyui-krea2edit", "rgthree-comfy"]);
     expect(result.missingPacks).toEqual([]);
   });
 });
@@ -195,13 +203,21 @@ describe("#2765 current catalogue: an exact listing that contradicts a naming co
     expect(d["Switch latent [Crystools]"]).toMatchObject({ pack: "Crystools", source: "manager_pattern" });
   });
 
-  it("install_deps queues the resolved packs and carries the ambiguous claim without queuing it", async () => {
+  it("install_deps queues the resolved repositories and carries the ambiguous claim without queuing it", async () => {
     const d = deps(CURRENT);
+    // Legacy Manager list: every candidate present, the unrelated one FIRST.
+    d.fetchManagerList = vi.fn(async () => ({
+      channel: "default",
+      packs: [
+        { id: "anomalous", title: "Anomalous Model Browser", reference: ANOMALOUS, files: [ANOMALOUS] },
+        { id: "comfyui-crystools", title: "Crystools", reference: CRYSTOOLS, files: [CRYSTOOLS] },
+        { id: "comfyui-krea2edit", title: "Krea 2 Identity Edit", reference: KREA2EDIT, files: [KREA2EDIT] },
+        { id: "rgthree-comfy", title: "Comfy Nodes", reference: RGTHREE, files: [RGTHREE] },
+      ],
+    }));
     const result = await installWorkflowDependencies(wf(...REPORTED), d);
-    const queued = vi.mocked(d.queueInstall).mock.calls.map(([p]) => p.id);
-    expect(queued.sort()).toEqual(["Crystools", KREA2EDIT]);
-    expect(queued).not.toContain(ANOMALOUS);
-    expect(queued).not.toContain("Anomalous Model Browser");
+    const queued = vi.mocked(d.queueInstall).mock.calls.map(([p]) => p.reference);
+    expect(queued.sort()).toEqual([CRYSTOOLS, KREA2EDIT]);
     expect(result.unresolved).toEqual(["Power Lora Loader (rgthree)"]);
     expect(result.ambiguous).toEqual([
       { class_type: "Power Lora Loader (rgthree)", claimants: [ANOMALOUS, RGTHREE] },
@@ -213,7 +229,7 @@ describe("#2765 current catalogue: an exact listing that contradicts a naming co
       "Power Lora Loader (rgthree)": def("Power Lora Loader (rgthree)", "custom_nodes.rgthree-comfy"),
     };
     const result = await extractWorkflowDependencies(wf("Power Lora Loader (rgthree)"), deps(CURRENT, objectInfo));
-    expect(result.dependencies[0]).toMatchObject({ pack: "Comfy Nodes", installed: true, source: "object_info" });
+    expect(result.dependencies[0]).toMatchObject({ pack: "rgthree-comfy", installed: true, source: "object_info" });
     expect(result.ambiguous).toBeUndefined();
   });
 
@@ -269,9 +285,12 @@ describe("#2765 pattern inference is bounded", () => {
     [OSTRIS_NODES]: [["One Seed - Ostris", "Text Box - Ostris"], { nodename_pattern: "- Ostris$", title_aux: "Ostris Nodes ComfyUI" }],
   };
 
-  it("two packs publishing one pattern: the pack that lists the class owns it", async () => {
-    const result = await extractWorkflowDependencies(wf("One Seed - Ostris"), deps(OSTRIS));
-    expect(result.dependencies[0]).toMatchObject({ pack: OSTRIS_NODES, source: "manager_mappings" });
+  it("two packs publishing one pattern: a listing does not erase the other pack's identical pattern", async () => {
+    // An identical pattern does not show who copied whom; both are claims on this class.
+    for (const m of [OSTRIS, reversed(OSTRIS)]) {
+      const result = await extractWorkflowDependencies(wf("One Seed - Ostris"), deps(m));
+      expect(result.dependencies[0]).toMatchObject({ pack: null, claimants: [FLEXTOOLS, OSTRIS_NODES] });
+    }
   });
 
   it("two packs publishing one pattern: an unlisted match is ambiguous, not first-wins", async () => {
@@ -306,5 +325,201 @@ describe("#2765 pattern inference is bounded", () => {
     );
     expect(result.unresolved).toEqual(["Anything"]);
     expect(result.mappings_unavailable).toContain("no usable entries");
+  });
+});
+
+describe("#2765 competing claims are never erased by a claimant's own pattern", () => {
+  const A = "https://github.com/a/widget-pack";
+  const B = "https://github.com/b/team-nodes";
+  const DISTINCT: Mappings = {
+    [A]: [["Widget (Team)", "WidgetBase"], { nodename_pattern: "^Widget", title: "Widget Pack" }],
+    [B]: [[], { nodename_pattern: " \\(Team\\)$", title: "Team Nodes" }],
+  };
+
+  it("A lists the class and matches it; B's DIFFERENT pattern still claims it: ambiguous in either order", async () => {
+    for (const m of [DISTINCT, reversed(DISTINCT)]) {
+      const d = deps(m);
+      const result = await extractWorkflowDependencies(wf("Widget (Team)"), d);
+      expect(result.dependencies[0]).toMatchObject({ pack: null, source: "unresolved", claimants: [A, B] });
+      expect(result.missingPacks).toEqual([]);
+      const install = await installWorkflowDependencies(wf("Widget (Team)"), d);
+      expect(install.installed).toEqual([]);
+      expect(d.resetQueue).not.toHaveBeenCalled();
+      expect(d.queueInstall).not.toHaveBeenCalled();
+      expect(d.startQueue).not.toHaveBeenCalled();
+    }
+  });
+
+  it("controls: a sole listing and a sole pattern still resolve, with their provenance", async () => {
+    for (const m of [DISTINCT, reversed(DISTINCT)]) {
+      const r = await extractWorkflowDependencies(wf("WidgetBase", "Gadget (Team)"), deps(m));
+      const d = byType(r.dependencies);
+      expect(d.WidgetBase).toMatchObject({ pack: "Widget Pack", repository: A, source: "manager_mappings" });
+      expect(d["Gadget (Team)"]).toMatchObject({ pack: "Team Nodes", repository: B, source: "manager_pattern" });
+    }
+  });
+});
+
+describe("#2765 patterns that constrain nothing are discarded", () => {
+  const LONE = "https://github.com/x/lone-pack";
+  for (const pattern of ["^[^\\x00]+$", "\\w+", "[\\s\\S]", "Foo|.*", "(?:Foo)?", "^(?<all>.+)$", ".{1,}"]) {
+    it(`${JSON.stringify(pattern)} claims nothing, even with no competing listing`, async () => {
+      const result = await extractWorkflowDependencies(
+        wf("Widget", "Load Image Batch"),
+        deps({ [LONE]: [[], { nodename_pattern: pattern, title_aux: "Lone" }] }),
+      );
+      expect(result.dependencies.every((dep) => dep.pack === null)).toBe(true);
+      expect(result.missingPacks).toEqual([]);
+    });
+  }
+
+  it("controls: real catalogue conventions still match their own names", async () => {
+    // Patterns copied verbatim from extension-node-map.json.
+    const real: Array<[string, string, string]> = [
+      ["https://github.com/rgthree/rgthree-comfy", " \\(rgthree\\)$", "Power Lora Loader (rgthree)"],
+      ["https://github.com/crystian/ComfyUI-Crystools", " \\[Crystools\\]$", "Switch latent [Crystools]"],
+      ["https://github.com/MrForExample/ComfyUI-3D-Pack", "^\\[Comfy3D\\]", "[Comfy3D] Load 3D Mesh"],
+      ["https://github.com/l3ony2k/comfyui-leon-nodes", "^\u{1F916} Leon", "\u{1F916} Leon Gemini"],
+      ["https://github.com/EricRollei/Download_Tools", "(Gallery-dl|Yt-dlp|Web.*Scraper)", "Yt-dlp Downloader"],
+      ["https://github.com/TinyTerra/ComfyUI_tinyterraNodes", "^ttN ", "ttN pipeLoader"],
+    ];
+    for (const [repo, pattern, name] of real) {
+      const result = await extractWorkflowDependencies(wf(name), deps({ [repo]: [[], { nodename_pattern: pattern }] }));
+      expect(result.dependencies[0]).toMatchObject({ repository: repo, source: "manager_pattern" });
+    }
+  });
+
+  it("a class the pattern's own repository ALSO lists still counts as foreign evidence", async () => {
+    const P = "https://github.com/p/foo-everything";
+    const X = "https://github.com/x/foo-a";
+    const Y = "https://github.com/y/foo-b";
+    const m: Mappings = {
+      [P]: [["FooA", "FooB"], { nodename_pattern: "^Foo", title_aux: "Foo Everything" }],
+      [X]: [["FooA"], { title_aux: "Foo A" }],
+      [Y]: [["FooB"], { title_aux: "Foo B" }],
+    };
+    for (const mm of [m, reversed(m)]) {
+      const result = await extractWorkflowDependencies(wf("FooNew"), deps(mm));
+      expect(result.dependencies[0]).toMatchObject({ pack: null, source: "unresolved" });
+      expect(result.dependencies[0].claimants).toBeUndefined();
+    }
+  });
+});
+
+describe("#2765 installed ownership is the loaded directory, not a basename coincidence", () => {
+  it("does not adopt an unrelated repository's title because its basename equals the directory", async () => {
+    const result = await extractWorkflowDependencies(
+      wf("Widget"),
+      deps(
+        { "https://github.com/unrelated/common-pack": [["Widget"], { title: "Unrelated Tools" }] },
+        { Widget: def("Widget", "custom_nodes.common-pack") },
+      ),
+    );
+    expect(result.dependencies[0]).toMatchObject({ pack: "common-pack", installed: true, source: "object_info" });
+    expect(result.dependencies[0].repository).toBeUndefined();
+    expect(result.requiredPacks).toEqual(["common-pack"]);
+  });
+});
+
+describe("#2765 install_deps enqueues exactly the resolved repository", () => {
+  const A = "https://github.com/a/shared-tools";
+  const B = "https://github.com/b/shared-tools";
+  const SHARED: Mappings = {
+    [A]: [["NodeA"], { title: "Shared" }],
+    [B]: [["NodeB"], { title: "Shared" }],
+  };
+  const LIST_A: ManagerNodePack = { id: "a-shared", title: "Shared", reference: A, files: [A], version: "1.0.0" };
+  const LIST_B: ManagerNodePack = { id: "b-shared", title: "Shared", reference: B, files: [B], version: "2.0.0" };
+
+  function legacy(m: Mappings, packs: ManagerNodePack[]): WorkflowDepsDeps {
+    const d = deps(m);
+    d.fetchManagerList = vi.fn(async () => ({ channel: "default", packs }));
+    return d;
+  }
+
+  it("two repositories sharing a title are never merged under it", async () => {
+    const result = await extractWorkflowDependencies(wf("NodeA", "NodeB"), deps(SHARED));
+    const d = byType(result.dependencies);
+    expect(d.NodeA).toMatchObject({ pack: A, repository: A });
+    expect(d.NodeB).toMatchObject({ pack: B, repository: B });
+    expect(result.missingPacks).toEqual([A, B]);
+  });
+
+  it("duplicate title: queues B's own list entry whatever the catalogue or list order", async () => {
+    for (const m of [SHARED, reversed(SHARED)]) {
+      for (const packs of [[LIST_A, LIST_B], [LIST_B, LIST_A]]) {
+        const d = legacy(m, packs);
+        const result = await installWorkflowDependencies(wf("NodeB"), d);
+        expect(vi.mocked(d.queueInstall).mock.calls).toEqual([[LIST_B, "default"]]);
+        expect(result.installed).toEqual([B]);
+      }
+    }
+  });
+
+  it("title-vs-id collision: another entry whose ID equals the resolved title is not queued", async () => {
+    const m: Mappings = { [A]: [["Widget"], { title: "Shared Tools" }] };
+    const impostor: ManagerNodePack = { id: "Shared Tools", title: "Impostor", reference: B, files: [B] };
+    const real: ManagerNodePack = { id: "a-shared", title: "Shared Tools", reference: A, files: [A] };
+    for (const packs of [[impostor, real], [real, impostor]]) {
+      const d = legacy(m, packs);
+      const result = await installWorkflowDependencies(wf("Widget"), d);
+      expect(vi.mocked(d.queueInstall).mock.calls).toEqual([[real, "default"]]);
+      expect(result.installed).toEqual(["Shared Tools"]);
+    }
+  });
+
+  it("an identity matching two list entries is refused with no reset, enqueue or start", async () => {
+    const m: Mappings = { [A]: [["Widget"], { title: "Shared Tools" }] };
+    const d = legacy(m, [
+      { id: "one", reference: A, files: [A] },
+      { id: "two", reference: "https://example.invalid/mirror", files: [A] },
+    ]);
+    const result = await installWorkflowDependencies(wf("Widget"), d);
+    expect(result.installed).toEqual([]);
+    expect(result.unresolved).toEqual(["Shared Tools"]);
+    expect(result.target_refusals).toEqual([
+      { pack: "Shared Tools", reason: `${A} matches 2 Manager list entries, so none was queued` },
+    ]);
+    expect(d.resetQueue).not.toHaveBeenCalled();
+    expect(d.queueInstall).not.toHaveBeenCalled();
+    expect(d.startQueue).not.toHaveBeenCalled();
+  });
+
+  it("legacy: an identity absent from the list is unresolved, never matched by title", async () => {
+    const m: Mappings = { [A]: [["Widget"], { title: "Shared Tools" }] };
+    const d = legacy(m, [{ id: "other", title: "Shared Tools", reference: B, files: [B] }]);
+    const result = await installWorkflowDependencies(wf("Widget"), d);
+    expect(result.unresolved).toEqual(["Shared Tools"]);
+    expect(d.queueInstall).not.toHaveBeenCalled();
+  });
+
+  it("v4: queues the registry id the catalogue resolved, not its display title", async () => {
+    const d = deps({ "comfyui-crystools": CRYSTOOLS_ENTRY });
+    const result = await installWorkflowDependencies(wf("Switch latent [Crystools]"), d);
+    expect(vi.mocked(d.queueInstall).mock.calls).toEqual([[{ id: "comfyui-crystools", version: "latest" }, "default"]]);
+    expect(result.installed).toEqual(["Crystools"]);
+  });
+
+  it("v4: a URL-keyed pack is refused rather than sent as an id v4 cannot resolve", async () => {
+    const d = deps({ [KREA2EDIT]: CURRENT[KREA2EDIT] });
+    const result = await installWorkflowDependencies(wf("Krea2EditGroundedEncode"), d);
+    expect(result.installed).toEqual([]);
+    expect(result.unresolved).toEqual([KREA2EDIT]);
+    expect(result.target_refusals?.[0]).toMatchObject({ pack: KREA2EDIT });
+    expect(d.resetQueue).not.toHaveBeenCalled();
+    expect(d.queueInstall).not.toHaveBeenCalled();
+    expect(d.startQueue).not.toHaveBeenCalled();
+  });
+
+  it("an externally supplied analysis without resolved identity installs nothing", async () => {
+    const d = deps({});
+    d.fetchManagerList = vi.fn(async () => ({ channel: "default", packs: [{ id: "Shared", title: "Shared", reference: A }] }));
+    const result = await installWorkflowDependenciesForAnalysis(
+      { classTypes: [], dependencies: [], requiredPacks: ["Shared"], missingPacks: ["Shared"], unresolved: [] },
+      d,
+    );
+    expect(result.installed).toEqual([]);
+    expect(result.target_refusals).toEqual([{ pack: "Shared", reason: "no resolved repository identity, so it was not queued" }]);
+    expect(d.queueInstall).not.toHaveBeenCalled();
   });
 });
