@@ -405,6 +405,7 @@ import {
   isRoutingAmbiguity,
   requiresWorkflowStampEnforcement,
   type DeliveredMutationReceipt,
+  type UncertainTarget,
   type UnsettledMutation,
 } from "../services/ui-bridge.js";
 import {
@@ -1614,7 +1615,40 @@ function mutationIdentityMatches(
       sameMutationScalar(retryCmd.value, delivered.value)
     );
   }
+  // #2955 — a run token names ONE run: a different batch or branch is a different
+  // run, and must never be answered from (or deduped onto) another run's receipt.
+  if (retryCmd.cmd === "graph_run") {
+    return (
+      sameMutationScalar(retryCmd.batch_count ?? 1, delivered.batch_count ?? 1) &&
+      sameMutationScalar(retryCmd.to_node_id, delivered.to_node_id)
+    );
+  }
   if ("node_id" in delivered) return sameMutationScalar(retryCmd.node_id, delivered.node_id);
+  return true;
+}
+
+/**
+ * #2955 — may this retry reply settle an outcome-unknown receipt? Only a
+ * definite, applied answer. A deferral (`waiting_for_queue_idle`), the panel's
+ * still-running duplicate (an error), a queue-uncertain reply, an explicit
+ * `applied:false`, a timeout or a drop all leave the outcome unknown. A widget
+ * write must report the `set` it applied.
+ */
+function isTerminalReconcileReply(cmd: Record<string, unknown>, res: ToolResult): boolean {
+  if (res.isError || isReplyTimeoutResult(res) || isMidCommandDisconnectResult(res)) return false;
+  const body = parseToolResultJson(res);
+  if (!body) return false;
+  if (
+    body.deferred === true ||
+    body.status === "waiting_for_queue_idle" ||
+    body.queued_unknown === true ||
+    body.applied === false
+  ) {
+    return false;
+  }
+  if (cmd.cmd === "graph_set_widget") {
+    return !!body.set && typeof body.set === "object" && !Array.isArray(body.set);
+  }
   return true;
 }
 
@@ -20750,6 +20784,9 @@ function withRetryToken(d: PanelToolDef): PanelToolDef {
       // workflow". Answer from the receipt instead. A sibling mutation inside
       // the same handler (enter_subgraph during a set_widget retry) must not
       // carry this token at all.
+      // #2955 — the retry's own dispatch of the original's exact command, kept so
+      // its outcome can settle that receipt AFTER the handler has judged it.
+      const reconcile: { last: { cmd: Record<string, unknown>; res: ToolResult } | null } = { last: null };
       const wrapped = Object.create(ctx) as PanelToolCtx;
       wrapped.call = (
         cmd: Record<string, unknown>,
@@ -20773,14 +20810,20 @@ function withRetryToken(d: PanelToolDef): PanelToolDef {
             const replay: Record<string, unknown> = { ...original.frame, retry_of: retryOf };
             delete replay.rid;
             return ctx.call(replay, timeoutMs, onDispatchedRid, beforeDispatch).then((res) => {
-              // #2955 — the panel answered the original's own token for the same
-              // command: it deduped onto the original's outcome or applied it now,
-              // and the original rid cannot land again behind it. That settles the
-              // outcome-unknown receipt a run barrier is holding on.
-              if (!res.isError) ctx.bridge?.markMutationReconciled?.(retryOf);
+              if (original.status !== "settled") reconcile.last = { cmd: replay, res };
               return res;
             });
           }
+        }
+        const sent = RETRY_TOKEN_CMDS.has(cmdName) ? { ...cmd, retry_of: retryOf } : cmd;
+        // #2955 — no receipt left for this token: the bridge may still hold an
+        // evicted-uncertainty marker for it, which only an identical command can
+        // resolve (markMutationReconciled checks the kept identity hash).
+        if (!original && RETRY_TOKEN_CMDS.has(cmdName)) {
+          return ctx.call(sent, timeoutMs, onDispatchedRid, beforeDispatch).then((res) => {
+            reconcile.last = { cmd: sent, res };
+            return res;
+          });
         }
         return ctx.call(
           // Ask the RETRY MAP's question, not the workflow fence's (codex gate).
@@ -20803,6 +20846,16 @@ function withRetryToken(d: PanelToolDef): PanelToolDef {
         );
       };
       const out = await d.handler(args, wrapped);
+      // #2955 — the panel's rid ledger answers an exact retry of a retained
+      // original with the original's own outcome (awaiting it if still running),
+      // and runs the same fingerprint fresh only when it holds no record of it.
+      // Only a TERMINAL answer — not a deferral, a still-running duplicate, an
+      // uncertain queue reply — and a handler that accepted it settle the
+      // outcome-unknown receipt a run barrier is holding on.
+      const candidate = reconcile.last;
+      if (candidate && !out.isError && isTerminalReconcileReply(candidate.cmd, candidate.res)) {
+        ctx.bridge?.markMutationReconciled?.(retryOf, candidate.cmd);
+      }
       // Drained AFTER the handler, deliberately, for two measured reasons.
       //
       // (1) The drain is destructive. Draining first meant a handler that threw
@@ -21010,6 +21063,12 @@ function runTargetDrift(before: RunTargetWitness, after: RunTargetWitness): stri
   return null;
 }
 
+/** An evicted-uncertainty marker binds like an unsettled edit: by workflow stamp. */
+function uncertaintyRelevantToRun(t: UncertainTarget, w: RunTargetWitness): boolean {
+  if (t.unstamped || w.workflow.known !== true || w.workflow.uuid === undefined) return true;
+  return t.workflowUuids.includes(w.workflow.uuid);
+}
+
 /**
  * An unsettled edit stamped for a DIFFERENT workflow than the one the run
  * would be stamped with cannot apply to this graph — the panel's write-time
@@ -21019,19 +21078,6 @@ function editRelevantToRun(m: UnsettledMutation, w: RunTargetWitness): boolean {
   const stamped = typeof m.frame.workflow_uuid === "string" ? m.frame.workflow_uuid : undefined;
   if (stamped === undefined || w.workflow.known !== true || w.workflow.uuid === undefined) return true;
   return stamped === w.workflow.uuid;
-}
-
-/**
- * A retry_of whose ORIGINAL run already has a definite local receipt — the
- * panel's late graph_run reply, or its exact late prompt receipt — is answered
- * by reconciliation, not by a new serialization, so no barrier applies to it.
- */
-function originalRunSettledLocally(bridge: PanelToolCtx["bridge"], retryOf: string): boolean {
-  const late = typeof bridge?.peekLateMutation === "function" ? bridge.peekLateMutation(retryOf) : undefined;
-  if (late && late.cmd === "graph_run" && "result" in late) return true;
-  const receipt =
-    typeof bridge?.peekLateRunReceipt === "function" ? bridge.peekLateRunReceipt(retryOf) : undefined;
-  return !!receipt && receipt.promptIds.length > 0;
 }
 
 function runFreshnessRefusal(retryOf: string | undefined, reasons: string[]): ToolResult {
@@ -21079,8 +21125,10 @@ function runFreshnessRefusal(retryOf: string | undefined, reasons: string[]): To
  * be identified; or when it is not provably the same canvas after the wait
  * (tab, pin, connection generation/incarnation, workflow stamp, graph-scope
  * witness). It never rebinds, re-dispatches an edit, or replays a run. A
- * retry_of whose original already has a local receipt reconciles straight
- * through; any other retry_of keeps its token in the refusal.
+ * retry_of gets no shortcut: while edits are outstanding it is refused like a
+ * fresh run, but its refusal keeps the ORIGINAL run's token and outcome-unknown
+ * guidance. Receipts the bounded cache had to forget still count (uncertainty
+ * markers): forgotten history is never read as freshness.
  */
 function withRunFreshnessBarrier(d: PanelToolDef): PanelToolDef {
   return {
@@ -21089,20 +21137,26 @@ function withRunFreshnessBarrier(d: PanelToolDef): PanelToolDef {
       const retryOf =
         typeof args.retry_of === "string" && args.retry_of !== "" ? args.retry_of : undefined;
       const bridge = ctx.bridge;
-      if (retryOf && originalRunSettledLocally(bridge, retryOf)) return d.handler(args, ctx);
       const before = captureRunTargetWitness(ctx);
       const intents = [...(mutationIntents.get(ctx) ?? [])];
       const edits =
         typeof bridge?.listUnsettledMutations === "function"
           ? bridge.listUnsettledMutations(before.tabId).filter((m) => editRelevantToRun(m, before))
           : [];
-      if (intents.length === 0 && edits.length === 0) return d.handler(args, ctx);
+      const evictedNow = () =>
+        typeof bridge?.listUncertainTargets === "function"
+          ? bridge.listUncertainTargets(before.tabId).filter((t) => uncertaintyRelevantToRun(t, before))
+          : [];
+      const evicted = evictedNow();
+      if (intents.length === 0 && edits.length === 0 && evicted.length === 0) {
+        return d.handler(args, ctx);
+      }
 
       const awaiting = edits.filter((m) => m.settlement === "awaiting");
       runFreshnessWaitObserver?.({
         intents: intents.length,
         awaited: awaiting.length,
-        unknown: edits.length - awaiting.length,
+        unknown: edits.length - awaiting.length + evicted.reduce((n, t) => n + t.count, 0),
       });
       const unverifiable = unverifiableRunTarget(before);
       if (unverifiable) {
@@ -21122,7 +21176,7 @@ function withRunFreshnessBarrier(d: PanelToolDef): PanelToolDef {
           Promise.all(intents.map((intent) => intent.done)),
           typeof bridge.waitForMutationSettlement === "function"
             ? bridge.waitForMutationSettlement(
-                edits.map((m) => m.rid),
+                [...edits.map((m) => m.rid), ...evicted.flatMap((t) => t.rids)],
                 budgetMs,
               )
             : undefined,
@@ -21186,6 +21240,26 @@ function withRunFreshnessBarrier(d: PanelToolDef): PanelToolDef {
             `is not known. Settle each first: re-issue that edit with its own retry_of token (the ` +
             `panel reconciles it against the original instead of applying it twice), or wait ` +
             `for its late acknowledgement — panel_run then proceeds.`,
+        );
+      }
+      const forgotten = evictedNow();
+      if (forgotten.length) {
+        const total = forgotten.reduce((n, t) => n + t.count, 0);
+        const tracked = forgotten.flatMap((t) => t.rids);
+        const cmds = [...new Set(forgotten.flatMap((t) => t.cmds))];
+        reasons.push(
+          `${total} earlier graph edit(s) on this canvas were dropped from the bridge's bounded ` +
+            `receipt memory while their outcome was still UNKNOWN (${cmds.join(", ") || "unrecorded commands"}). ` +
+            `Forgotten history is not freshness: they may have applied or may still apply. ` +
+            (tracked.length
+              ? `Settle each by re-issuing that exact edit with its own token (${tracked
+                  .map((rid) => `retry_of:"${rid}"`)
+                  .join(", ")}) or by its late acknowledgement. `
+              : "") +
+            (total > tracked.length
+              ? `${total - tracked.length} of them were not individually tracked and clear only when ` +
+                `the browser tab that received them is gone (closed, and not back within its grace). `
+              : ""),
         );
       }
       if (reasons.length) return runFreshnessRefusal(retryOf, reasons);

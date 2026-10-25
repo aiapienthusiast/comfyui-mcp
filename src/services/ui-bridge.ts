@@ -15,7 +15,7 @@
 // or `{ rid, ok: false, error }`. Frames WITHOUT a rid are panel-initiated
 // events (`hello`, `user_message`) and flow to `onPanelMessage`.
 
-import { randomUUID, timingSafeEqual } from "node:crypto";
+import { createHash, randomUUID, timingSafeEqual } from "node:crypto";
 import { WebSocketServer, WebSocket } from "ws";
 import { resolveLocale, trFor, type Locale } from "../i18n/index.js";
 import { logger } from "../utils/logger.js";
@@ -2068,6 +2068,48 @@ export type MutationSettlement = "settled" | "awaiting" | "unknown";
 /** #2955 — a delivered mutation whose outcome is not yet definite. */
 export type UnsettledMutation = DeliveredMutationReceipt & { settlement: "awaiting" | "unknown" };
 
+/** #2955 — the marker key that applies to every tab (marker-capacity overflow). */
+export const ALL_TABS_UNCERTAINTY = "*";
+
+/**
+ * #2955 — unknown-outcome receipts the bridge had to forget (TTL or capacity),
+ * compacted for one canonical tab. `count` is how many were evicted and are
+ * still unresolved; `rids` tracks up to MAX_UNCERTAIN_RIDS of them with an
+ * identity hash of the command, so a late reply or an exact retry_of can
+ * resolve them one by one. Untracked ones (count > rids.size) can only be
+ * cleared by retiring the tab's incarnation.
+ */
+type EvictedUncertainty = {
+  workflowUuids: Set<string>;
+  unstamped: boolean;
+  count: number;
+  rids: Map<string, string>;
+  cmds: Set<string>;
+  since: number;
+};
+
+/** #2955 — a read-only view of one uncertainty marker. */
+export type UncertainTarget = {
+  tabId: string;
+  count: number;
+  workflowUuids: string[];
+  unstamped: boolean;
+  rids: string[];
+  cmds: string[];
+  since: number;
+};
+
+/** #2955 — the identity a receipt / retry must share to resolve one another. */
+export function mutationIdentityHash(frame: Record<string, unknown>): string {
+  let value: string;
+  try {
+    value = JSON.stringify([frame.cmd, frame.node_id ?? null, frame.widget ?? null, frame.value ?? null]);
+  } catch {
+    value = String(frame.cmd);
+  }
+  return createHash("sha256").update(value).digest("hex").slice(0, 32);
+}
+
 /** Peek of a delivered mutation, including one that already settled late. */
 export type PeekedDeliveredMutation = {
   rid: string;
@@ -2560,6 +2602,15 @@ export class UiBridge {
    *  mid-command drop and a workflow replacement all leave it with the outcome
    *  unknown — so a run barrier reads settlement only from here. */
   private settledMutations = new Map<string, { tabId: string; ts: number }>();
+  /** #2955 — what bounded memory could not keep: unknown-outcome receipts evicted
+   *  by TTL or capacity, compacted per canonical tab (plus one global overflow
+   *  marker). A marker is cleared only by a definite outcome for a tracked rid
+   *  (late reply, exact terminal retry_of) or by retiring the tab's browser
+   *  incarnation (fireTabGone) — never by elapsed time. See evictUnsettledReceipt. */
+  private uncertainty = new Map<string, EvictedUncertainty>();
+  private static readonly MAX_UNCERTAIN_TARGETS = 64;
+  private static readonly MAX_UNCERTAIN_RIDS = 32;
+  private static readonly MAX_UNCERTAIN_CMDS = 8;
   /** Exact prompt receipts sent by the Panel after its graph_run command returned. */
   private lateRunReceipts = new Map<
     string,
@@ -4831,7 +4882,12 @@ export class UiBridge {
    */
   private recordLateMutation(rid: string, msg: { ok?: unknown; result?: unknown }): void {
     const started = this.deliveredMutations.get(rid);
-    if (!started) return;
+    if (!started) {
+      // #2955 — the receipt itself was evicted while its outcome was unknown; a
+      // late reply (either verdict) is still that rid's definite outcome.
+      this.resolveEvictedRid(rid);
+      return;
+    }
     this.deliveredMutations.delete(rid);
     // #2955 — a late refusal is as definite as a late success for a run barrier:
     // the frontend has finished with this command either way.
@@ -4959,43 +5015,33 @@ export class UiBridge {
   }
 
   /**
-   * #2955 — every delivered mutation on `tabId` (or on the socket it is routed
-   * to) whose outcome is not yet DEFINITE, oldest first:
+   * #2955 — every mutation on `tabId` (or on the socket it is routed to) whose
+   * outcome is not yet DEFINITE, oldest first:
    *  - `awaiting` — the frame is on the panel and its reply is still awaited;
    *  - `unknown`  — nothing is awaiting it any more but no outcome arrived: a
    *    reply timeout, a mid-command drop, or a same-tab workflow replacement
    *    that cancelled the waiter (dropQueuedDeliveries). The command may still
    *    have applied, or may yet.
-   * graph_run frames are excluded: one run's acknowledgement does not change
-   * what another run serializes. A run barrier must read THIS, not "left
-   * `pending`", because every one of those exits also leaves `pending`.
+   * In-flight requests are enumerated from `pending` itself as well, so an
+   * awaited mutation stays discoverable whatever the bounded receipt cache
+   * holds. Receipts the cache had to forget are reported separately by
+   * listUncertainTargets. graph_run frames are excluded: one run's
+   * acknowledgement does not change what another run serializes.
    */
   listUnsettledMutations(tabId: string): UnsettledMutation[] {
     this.pruneLateMutations();
-    // Route the address the way send() does (exact id, prefix, same-socket
-    // migration alias, or a session scope address such as orchestrator::<backend>,
-    // #884): receipts are recorded under the CANONICAL live tab id, so an exact
-    // comparison against a scope address would see none of them.
-    let canonical = tabId;
-    let routedSock: BridgeSocket | undefined;
-    try {
-      const conn = this.resolveTarget(tabId);
-      canonical = conn.tabId;
-      routedSock = conn.sock;
-    } catch {
-      routedSock = this.conns.get(tabId)?.sock;
-    }
+    const { canonical, routedSock } = this.routeForReceipts(tabId);
+    const matches = (receiptTab: string, p: Pending | undefined) =>
+      receiptTab === tabId ||
+      receiptTab === canonical ||
+      p?.ctx.tabId === tabId ||
+      p?.ctx.tabId === canonical ||
+      (routedSock !== undefined && p !== undefined && p.sock === routedSock);
     const out: UnsettledMutation[] = [];
     for (const [rid, e] of this.deliveredMutations) {
       if (e.cmd === "graph_run") continue;
       const p = this.pending.get(rid);
-      const sameTab =
-        e.tabId === tabId ||
-        e.tabId === canonical ||
-        p?.ctx.tabId === tabId ||
-        p?.ctx.tabId === canonical;
-      const sameSocket = routedSock !== undefined && p !== undefined && p.sock === routedSock;
-      if (!sameTab && !sameSocket) continue;
+      if (!matches(e.tabId, p)) continue;
       out.push({
         rid,
         cmd: e.cmd,
@@ -5004,6 +5050,19 @@ export class UiBridge {
         frame: e.frame,
         status: e.status,
         settlement: p !== undefined && e.status === "in_flight" ? "awaiting" : "unknown",
+      });
+    }
+    for (const [rid, p] of this.pending) {
+      if (this.deliveredMutations.has(rid) || !this.isTrackedMutation(p.cmd)) continue;
+      if (!matches(p.ctx.tabId, p)) continue;
+      out.push({
+        rid,
+        cmd: p.cmd,
+        tabId: p.ctx.tabId,
+        ts: p.ctx.deadline - p.ctx.timeoutMs,
+        frame: cloneDeliveredMutationFrame(p.ctx.command),
+        status: "in_flight",
+        settlement: "awaiting",
       });
     }
     return out;
@@ -5017,14 +5076,41 @@ export class UiBridge {
   }
 
   /**
-   * #2955 — the outcome of one delivered mutation as a run barrier may rely on
-   * it. Only a recorded definite outcome is `settled`; an rid the bridge no
-   * longer holds at all (pruned, never seen) is `unknown`, never `settled`.
+   * #2955 — unknown-outcome receipts that were evicted from bounded memory and
+   * are still unresolved, for `tabId`'s canonical tab plus the all-tabs
+   * overflow marker. A run must treat each as an outcome it cannot see.
+   */
+  listUncertainTargets(tabId: string): UncertainTarget[] {
+    this.pruneLateMutations();
+    const { canonical } = this.routeForReceipts(tabId);
+    const out: UncertainTarget[] = [];
+    for (const key of new Set([canonical, tabId, ALL_TABS_UNCERTAINTY])) {
+      const marker = this.uncertainty.get(key);
+      if (!marker) continue;
+      out.push({
+        tabId: key,
+        count: marker.count,
+        workflowUuids: [...marker.workflowUuids],
+        unstamped: marker.unstamped,
+        rids: [...marker.rids.keys()],
+        cmds: [...marker.cmds],
+        since: marker.since,
+      });
+    }
+    return out;
+  }
+
+  /**
+   * #2955 — the outcome of one mutation as a run barrier may rely on it. Only a
+   * recorded definite outcome is `settled`; an rid the bridge no longer holds,
+   * or holds only as an evicted uncertainty, is `unknown`, never `settled`.
    */
   mutationSettlement(rid: string): MutationSettlement {
     if (this.settledMutations.has(rid) || this.lateMutations.has(rid)) return "settled";
-    const e = this.deliveredMutations.get(rid);
-    if (e && e.status === "in_flight" && this.pending.has(rid)) return "awaiting";
+    const p = this.pending.get(rid);
+    if (p && this.isTrackedMutation(p.cmd) && this.deliveredMutations.get(rid)?.status !== "timed_out") {
+      return "awaiting";
+    }
     return "unknown";
   }
 
@@ -5053,24 +5139,142 @@ export class UiBridge {
   }
 
   /**
-   * #2955 — an exact retry_of of this outcome-unknown mutation was answered
-   * successfully: the panel either deduped it onto the original's outcome or
-   * applied it now, and the original rid cannot apply again behind it. Record
-   * that as the definite outcome so a run barrier can proceed. Only an
-   * unsettled delivered receipt that is not awaiting its own reply qualifies.
+   * #2955 — an exact retry_of of this outcome-unknown mutation was answered with
+   * a TERMINAL result (the caller checks that; see panel-tools
+   * isTerminalReconcileReply). The panel's rid ledger answers a retained
+   * original's retry with the original's own outcome — awaiting it if still
+   * running — and executes the same fingerprint fresh only when it holds no
+   * record of the original. Either way the requested command is now in effect
+   * and no original is still running behind it in that ledger. `retried` must be
+   * the command the retry carried: it has to be the same command as the
+   * receipt (or as the identity hash an evicted marker kept for it).
    */
-  markMutationReconciled(rid: string): boolean {
+  markMutationReconciled(rid: string, retried: Record<string, unknown>): boolean {
     const e = this.deliveredMutations.get(rid);
-    if (!e || this.mutationSettlement(rid) !== "unknown") return false;
-    this.deliveredMutations.delete(rid);
-    this.recordMutationSettled(rid, e.tabId);
-    this.notifyMutationSettled(e.tabId);
-    return true;
+    if (e) {
+      if (this.mutationSettlement(rid) !== "unknown") return false;
+      if (mutationIdentityHash(e.frame) !== mutationIdentityHash(retried)) return false;
+      this.deliveredMutations.delete(rid);
+      this.recordMutationSettled(rid, e.tabId);
+      this.notifyMutationSettled(e.tabId);
+      return true;
+    }
+    return this.resolveEvictedRid(rid, mutationIdentityHash(retried));
   }
 
   private recordMutationSettled(rid: string, tabId: string): void {
     this.settledMutations.set(rid, { tabId, ts: Date.now() });
     this.pruneLateMutations();
+    this.notifyMutationReplyWaiters();
+  }
+
+  /** Commands whose receipts the retry-token layer tracks (setLateMutationFilter). */
+  private isTrackedMutation(cmd: string): boolean {
+    return cmd !== "graph_run" && this.lateMutationFilter?.(cmd) === true;
+  }
+
+  /** Route `tabId` the way send() does, for receipt matching (#884 scope addresses). */
+  private routeForReceipts(tabId: string): { canonical: string; routedSock: BridgeSocket | undefined } {
+    try {
+      const conn = this.resolveTarget(tabId);
+      return { canonical: conn.tabId, routedSock: conn.sock };
+    } catch {
+      return { canonical: tabId, routedSock: this.conns.get(tabId)?.sock };
+    }
+  }
+
+  /**
+   * #2955 — forget one delivered receipt whose reply is not awaited. A receipt
+   * whose outcome is unknown leaves a compact, target-bound marker: its tab,
+   * the workflow stamp it carried, and (while there is room) its rid and
+   * identity hash. Memory stays bounded — MAX_UNCERTAIN_TARGETS markers, each
+   * tracking at most MAX_UNCERTAIN_RIDS rids — and overflow folds into the
+   * all-tabs marker, so uncertainty is compacted but never silently dropped.
+   */
+  private evictUnsettledReceipt(
+    rid: string,
+    e: { cmd: string; tabId: string; frame: Record<string, unknown> },
+  ): void {
+    this.deliveredMutations.delete(rid);
+    if (e.cmd === "graph_run") return;
+    let key = e.tabId;
+    if (!this.uncertainty.has(key) && this.uncertainty.size >= UiBridge.MAX_UNCERTAIN_TARGETS) {
+      // Fold the OLDEST per-tab marker into the all-tabs one to make room.
+      for (const [oldKey, old] of this.uncertainty) {
+        if (oldKey === ALL_TABS_UNCERTAINTY) continue;
+        this.uncertainty.delete(oldKey);
+        this.mergeUncertainty(ALL_TABS_UNCERTAINTY, old);
+        break;
+      }
+      if (this.uncertainty.size >= UiBridge.MAX_UNCERTAIN_TARGETS) key = ALL_TABS_UNCERTAINTY;
+    }
+    const stamp = typeof e.frame.workflow_uuid === "string" ? e.frame.workflow_uuid : undefined;
+    this.mergeUncertainty(key, {
+      workflowUuids: new Set(stamp ? [stamp] : []),
+      unstamped: stamp === undefined,
+      count: 1,
+      rids: new Map([[rid, mutationIdentityHash(e.frame)]]),
+      cmds: new Set([e.cmd]),
+      since: Date.now(),
+    });
+    logger.debug(
+      `[ui-bridge] "${e.cmd}" receipt ${rid} on ${e.tabId} evicted with its outcome UNKNOWN — kept as an uncertainty marker (#2955)`,
+    );
+  }
+
+  private mergeUncertainty(key: string, add: EvictedUncertainty): void {
+    const into = this.uncertainty.get(key) ?? {
+      workflowUuids: new Set<string>(),
+      unstamped: false,
+      count: 0,
+      rids: new Map<string, string>(),
+      cmds: new Set<string>(),
+      since: add.since,
+    };
+    for (const uuid of add.workflowUuids) {
+      if (into.workflowUuids.size < UiBridge.MAX_UNCERTAIN_RIDS) into.workflowUuids.add(uuid);
+      else into.unstamped = true; // too many to bind: treat as applying to any workflow on the tab
+    }
+    into.unstamped ||= add.unstamped;
+    into.count += add.count;
+    for (const [rid, hash] of add.rids) {
+      if (into.rids.size < UiBridge.MAX_UNCERTAIN_RIDS) into.rids.set(rid, hash);
+    }
+    for (const cmd of add.cmds) {
+      if (into.cmds.size < UiBridge.MAX_UNCERTAIN_CMDS) into.cmds.add(cmd);
+    }
+    into.since = Math.min(into.since, add.since);
+    this.uncertainty.set(key, into);
+  }
+
+  /** A definite outcome for an evicted rid: drop it from its marker. */
+  private resolveEvictedRid(rid: string, identityHash?: string): boolean {
+    for (const [key, marker] of this.uncertainty) {
+      const hash = marker.rids.get(rid);
+      if (hash === undefined) continue;
+      if (identityHash !== undefined && hash !== identityHash) return false;
+      marker.rids.delete(rid);
+      marker.count -= 1;
+      if (marker.count <= 0) this.uncertainty.delete(key);
+      this.recordMutationSettled(rid, key);
+      return true;
+    }
+    return false;
+  }
+
+  /**
+   * #2955 — identity retirement. The browser-tab incarnation that held this
+   * tab's canvas did not return within its grace (fireTabGone): no command it
+   * was still running can apply any more, so its unknown outcomes stop
+   * describing any live canvas. Awaited requests are untouched.
+   */
+  private retireTabUncertainty(tabId: string): void {
+    this.uncertainty.delete(tabId);
+    for (const [rid, e] of this.deliveredMutations) {
+      if (e.tabId !== tabId || this.pending.has(rid)) continue;
+      this.deliveredMutations.delete(rid);
+    }
+    this.notifyMutationSettled(tabId);
     this.notifyMutationReplyWaiters();
   }
 
@@ -5227,7 +5431,11 @@ export class UiBridge {
     const prunedTabs = new Set<string>();
     for (const [rid, e] of this.deliveredMutations) {
       if (now - e.ts > UiBridge.LATE_MUTATION_TTL_MS) {
-        this.deliveredMutations.delete(rid);
+        // #2955 — a receipt whose reply is still awaited is never evicted (it is
+        // bounded by `pending` itself), and one whose outcome is unknown leaves a
+        // compact uncertainty marker: forgetting it is not evidence it settled.
+        if (this.pending.has(rid)) continue;
+        this.evictUnsettledReceipt(rid, e);
         prunedTabs.add(e.tabId);
       }
     }
@@ -5247,8 +5455,17 @@ export class UiBridge {
     // oldest. Quiet, unlike the ask-mapping overflow: losing one of 256 late
     // completions costs the caller a notice they can still get by looking, where
     // losing an ask mapping loses a user's answer outright.
+    // #2955 — capacity for delivered receipts: evict the oldest whose reply is not
+    // awaited, into the uncertainty markers; awaited ones stay discoverable.
+    if (this.deliveredMutations.size > UiBridge.MAX_LATE_MUTATIONS) {
+      for (const [rid, e] of this.deliveredMutations) {
+        if (this.deliveredMutations.size <= UiBridge.MAX_LATE_MUTATIONS) break;
+        if (this.pending.has(rid)) continue;
+        this.evictUnsettledReceipt(rid, e);
+        prunedTabs.add(e.tabId);
+      }
+    }
     for (const map of [
-      this.deliveredMutations,
       this.lateMutations,
       this.lateRunReceipts,
       this.lateRunReceiptHandoffs,
@@ -5415,6 +5632,9 @@ export class UiBridge {
     // Re-check on the INCARNATION, not the key: something else may now hold this
     // recurring id, and a stranger holding the key is not this tab coming back.
     if (this.conns.get(tabId)?.incarnationId === incarnation) return;
+    // #2955 — retire only when NOTHING holds the key: if a different browser tab
+    // has taken it over, receipts under this id may be its own, so they stay.
+    if (!this.conns.has(tabId)) this.retireTabUncertainty(tabId);
     try {
       this.onTabGone?.(tabId, incarnation);
     } catch (err) {
@@ -7106,20 +7326,23 @@ export class UiBridge {
    */
   private retainAbandonedMutation(rid: string, cmd: string, tabId: string): void {
     if (!rid || !this.lateMutationFilter?.(cmd)) return;
-    this.pruneLateMutations();
+    // #2955 — update this rid's OWN receipt before pruning: its waiter has just
+    // left `pending`, so a capacity pass run first would evict it as unknown and
+    // the line below would mint a second receipt for the same rid.
     const prior = this.deliveredMutations.get(rid);
     if (prior) {
       prior.status = "timed_out";
       prior.ts = Date.now();
-      return;
+    } else {
+      this.deliveredMutations.set(rid, {
+        cmd,
+        tabId,
+        ts: Date.now(),
+        frame: { cmd },
+        status: "timed_out",
+      });
     }
-    this.deliveredMutations.set(rid, {
-      cmd,
-      tabId,
-      ts: Date.now(),
-      frame: { cmd },
-      status: "timed_out",
-    });
+    this.pruneLateMutations();
   }
 
   /** A pending command's socket died before its reply arrived. Decide, WITHOUT

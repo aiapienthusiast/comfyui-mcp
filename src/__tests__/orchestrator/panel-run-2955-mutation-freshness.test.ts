@@ -16,7 +16,7 @@
 // UiBridge; no live canvas is involved.
 
 import { createServer } from "node:net";
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import WebSocket from "ws";
 import { UiBridge } from "../../services/ui-bridge.js";
 import {
@@ -32,6 +32,7 @@ import { WorkflowTargetStore } from "../../services/workflow-target-store.js";
 import { waitFor } from "../helpers/wait-for.js";
 
 const TAB = "wf:workflows/chizu_scout.json";
+const TAB2 = "wf:workflows/other_canvas.json";
 const WORKFLOW_UUID = "22222222-2222-4222-8222-222222222222";
 const PROMPT_NODE = 6;
 const SAVE_NODE = 9;
@@ -74,12 +75,12 @@ async function startBridge(): Promise<void> {
   throw new Error(`could not bind a free bridge port after 6 attempts: ${lastErr}`);
 }
 
-function helloFrame(): string {
+function helloFrame(tab = TAB, session = "browser-tab-2955"): string {
   return JSON.stringify({
     type: "hello",
-    tab_id: TAB,
+    tab_id: tab,
     title: "chizu_scout",
-    tab_session_id: "browser-tab-2955",
+    tab_session_id: session,
     enforces_workflow_stamp: true,
     enforces_workflow_stamp_at_write: true,
     enforces_expected_node_type_at_write: true,
@@ -87,11 +88,11 @@ function helloFrame(): string {
   });
 }
 
-function connectPanel(): Promise<WebSocket> {
+function connectPanel(tab = TAB, session?: string): Promise<WebSocket> {
   return new Promise((resolve, reject) => {
     const sock = new WebSocket(`ws://127.0.0.1:${port}`);
     sock.on("open", () => {
-      sock.send(helloFrame());
+      sock.send(helloFrame(tab, session ?? (tab === TAB ? "browser-tab-2955" : `browser-tab-${tab}`)));
       resolve(sock);
     });
     sock.on("error", reject);
@@ -111,12 +112,37 @@ function viewing() {
 type Widgets = { text: string; filename_prefix: string };
 type HeldWrite = { msg: Record<string, unknown>; release: (opts?: { ok?: boolean }) => void };
 
+type PanelOpts = {
+  holdRuns?: boolean;
+  holdRead?: string;
+  /** Never answer this command (its reply is lost; the bridge times it out). */
+  dropCmd?: string;
+  /**
+   * Model the panel's rid ledger (#517/#694, comfyui-mcp-panel command-dedupe):
+   * a retry_of whose original the ledger holds with the SAME fingerprint is
+   * answered with the original's own reply — joining it if still running, no
+   * second apply; a different fingerprint is rejected before execution; an
+   * unknown token fails open and executes fresh.
+   */
+  ledger?: boolean;
+  /** With ledger: a joined duplicate gives up after this long with the panel's
+   *  "STILL RUNNING … DO NOT RETRY" error (awaitDuplicateReply's bound). */
+  duplicateBudgetMs?: number;
+  /** A retry the ledger does not know is parked (defer_until_idle-shaped reply). */
+  deferUnknownRetry?: boolean;
+};
+
 type ScriptedPanel = {
   readonly values: Widgets;
-  /** One entry per graph_run frame that reached the panel: what it serialized. */
+  /** One entry per graph_run the panel EXECUTED (serialized): what it serialized. */
   readonly runs: Array<{ rid: string; serialized: Widgets }>;
+  /** graph_set_widget executions (fresh writes) that reached the panel, held until released. */
   readonly writes: HeldWrite[];
-  /** Resolves once `n` graph_set_widget frames have reached the panel. */
+  /** How many widget writes were actually APPLIED to the graph. */
+  readonly applyCount: number;
+  /** graph_set_widget frames answered from the ledger instead of executing. */
+  readonly ledgerAnswers: number;
+  /** Resolves once `n` executing graph_set_widget frames have reached the panel. */
   writesArrived(n: number): Promise<void>;
   /** Resolves when the first graph_run frame reaches the panel. */
   runArrived(): Promise<void>;
@@ -127,6 +153,8 @@ type ScriptedPanel = {
   /** With holdRead, how many are held, and answer them all. */
   readonly heldReadCount: number;
   releaseReads(): void;
+  /** Frames of `dropCmd` that reached the panel. */
+  readonly dropped: Array<Record<string, unknown>>;
 };
 
 function nodeRow(id: unknown, values: Widgets) {
@@ -140,46 +168,111 @@ function nodeRow(id: unknown, values: Widgets) {
   };
 }
 
+const RETRY_REJECTED = "Retry rejected: retry_of refers to a different command or workflow.";
+
 /**
  * graph_set_widget is HELD until the test releases it (the frontend's
  * /object_info await before applyWidgetWrite), then applied and acked.
  * graph_run serializes the values present when its frame arrives.
  */
-function attachPanel(
-  sock: WebSocket,
-  opts: { holdRuns?: boolean; holdRead?: string } = {},
-): ScriptedPanel {
+function attachPanel(sock: WebSocket, opts: PanelOpts = {}): ScriptedPanel {
   const values: Widgets = { ...OLD };
   const runs: Array<{ rid: string; serialized: Widgets }> = [];
   const writes: HeldWrite[] = [];
+  const dropped: Array<Record<string, unknown>> = [];
   const arrivalWaiters: Array<{ n: number; resolve: () => void }> = [];
   const runWaiters: Array<() => void> = [];
   const heldReads: Array<() => void> = [];
+  let applyCount = 0;
+  let ledgerAnswers = 0;
+  type Entry = { fp: string; reply?: Record<string, unknown>; joiners: string[] };
+  const writeLedger = new Map<string, Entry>();
+  const runLedger = new Map<string, Entry>();
+  const send = (frame: Record<string, unknown>) => sock.send(JSON.stringify(frame));
+  const writeFp = (m: Record<string, unknown>) => JSON.stringify([m.node_id, m.widget, m.value]);
+  const runFp = (m: Record<string, unknown>) => JSON.stringify([m.batch_count ?? 1, m.to_node_id ?? null]);
+  const settleEntry = (entry: Entry | undefined, reply: Record<string, unknown>) => {
+    if (!entry) return;
+    entry.reply = reply;
+    for (const joiner of entry.joiners.splice(0)) send({ ...reply, rid: joiner });
+  };
+  /** true when the ledger answered (or will answer) this retry without executing it */
+  const answerFromLedger = (ledger: Map<string, Entry>, msg: Record<string, unknown>, fp: string): boolean => {
+    if (!opts.ledger || typeof msg.retry_of !== "string") return false;
+    const original = ledger.get(msg.retry_of);
+    if (!original) return false; // fails open: execute fresh
+    const rid = msg.rid as string;
+    ledgerAnswers += 1;
+    if (original.fp !== fp) {
+      send({ rid, ok: false, error: RETRY_REJECTED });
+      return true;
+    }
+    if (original.reply) {
+      send({ ...original.reply, rid });
+      return true;
+    }
+    original.joiners.push(rid);
+    if (opts.duplicateBudgetMs !== undefined) {
+      setTimeout(() => {
+        const at = original.joiners.indexOf(rid);
+        if (at < 0) return;
+        original.joiners.splice(at, 1);
+        send({
+          rid,
+          ok: false,
+          error:
+            "This request id is STILL RUNNING in the panel and has not produced an outcome. This " +
+            "delivery was a DUPLICATE of it, so nothing new was started and nothing was applied twice. " +
+            "DO NOT RETRY: the original may still complete.",
+        });
+      }, opts.duplicateBudgetMs);
+    }
+    return true;
+  };
   sock.on("message", (buf) => {
     const msg = JSON.parse(buf.toString()) as Record<string, unknown>;
     if (typeof msg.rid !== "string" || typeof msg.cmd !== "string") return;
     const rid = msg.rid;
+    if (opts.dropCmd && msg.cmd === opts.dropCmd) {
+      dropped.push(msg);
+      return;
+    }
     if (msg.cmd === "graph_set_widget") {
+      const fp = writeFp(msg);
+      if (answerFromLedger(writeLedger, msg, fp)) return;
+      if (opts.deferUnknownRetry && typeof msg.retry_of === "string") {
+        send({
+          rid,
+          ok: true,
+          result: { deferred: true, receipt: `defer-${rid}`, status: "waiting_for_queue_idle" },
+        });
+        return;
+      }
+      const entry: Entry = { fp, joiners: [] };
+      writeLedger.set(rid, entry);
       let done = false;
       writes.push({
         msg,
-        release: (opts) => {
+        release: (releaseOpts) => {
           if (done) return;
           done = true;
-          if (opts?.ok === false) {
-            sock.send(JSON.stringify({ rid, ok: false, error: "widget write refused by the panel" }));
+          if (releaseOpts?.ok === false) {
+            const reply = { rid, ok: false, error: "widget write refused by the panel" };
+            send(reply);
+            settleEntry(entry, reply);
             return;
           }
           const widget = msg.widget as keyof Widgets;
           const previous = values[widget];
           values[widget] = String(msg.value);
-          sock.send(
-            JSON.stringify({
-              rid,
-              ok: true,
-              result: { set: { node_id: msg.node_id, widget, previous, value: msg.value } },
-            }),
-          );
+          applyCount += 1;
+          const reply = {
+            rid,
+            ok: true,
+            result: { set: { node_id: msg.node_id, widget, previous, value: msg.value } },
+          };
+          send(reply);
+          settleEntry(entry, reply);
         },
       });
       for (const w of arrivalWaiters.splice(0)) {
@@ -189,16 +282,19 @@ function attachPanel(
       return;
     }
     if (msg.cmd === "graph_run") {
+      const fp = runFp(msg);
+      if (answerFromLedger(runLedger, msg, fp)) return;
+      runLedger.set(rid, { fp, joiners: [] });
       runs.push({ rid, serialized: { ...values } });
       for (const resolve of runWaiters.splice(0)) resolve();
       if (opts.holdRuns) return;
-      sock.send(
-        JSON.stringify({ rid, ok: true, result: { queued: true, prompt_id: `p-2955-${runs.length}` } }),
-      );
+      const reply = { rid, ok: true, result: { queued: true, prompt_id: `p-2955-${runs.length}` } };
+      send(reply);
+      settleEntry(runLedger.get(rid), reply);
       return;
     }
     if (opts.holdRead && msg.cmd === opts.holdRead) {
-      heldReads.push(() => sock.send(JSON.stringify({ rid, ok: true, result: { errors: [] } })));
+      heldReads.push(() => send({ rid, ok: true, result: { errors: [] } }));
       return;
     }
     const ids = Array.isArray(msg.ids) ? msg.ids : [msg.node_id ?? PROMPT_NODE];
@@ -206,7 +302,7 @@ function attachPanel(
       msg.cmd === "graph_query" || msg.cmd === "graph_get_subgraph"
         ? { viewing: viewing(), truncated: false, nodes: ids.map((id) => nodeRow(id, values)), node_count: ids.length }
         : { ok: true };
-    sock.send(JSON.stringify({ rid, ok: true, result }));
+    send({ rid, ok: true, result });
   });
   return {
     get values() {
@@ -214,6 +310,13 @@ function attachPanel(
     },
     runs,
     writes,
+    dropped,
+    get applyCount() {
+      return applyCount;
+    },
+    get ledgerAnswers() {
+      return ledgerAnswers;
+    },
     writesArrived(n: number) {
       if (writes.length >= n) return Promise.resolve();
       return new Promise((resolve) => arrivalWaiters.push({ n, resolve }));
@@ -232,9 +335,9 @@ function attachPanel(
     releaseRun(i: number) {
       const run = runs[i];
       if (!run) throw new Error(`no graph_run #${i} reached the panel`);
-      sock.send(
-        JSON.stringify({ rid: run.rid, ok: true, result: { queued: true, prompt_id: `p-2955-${i + 1}` } }),
-      );
+      const reply = { rid: run.rid, ok: true, result: { queued: true, prompt_id: `p-2955-${i + 1}` } };
+      send(reply);
+      settleEntry(runLedger.get(run.rid), reply);
     },
   };
 }
@@ -248,14 +351,14 @@ function defByName(name: string) {
 const textOf = (res: ToolResult): string =>
   res.content.map((c) => (c as { text?: string }).text ?? "").join(" ");
 
-function newCtx(): PanelToolCtx {
-  return makePanelToolCtx(bridge, TAB, new WorkflowTargetStore());
+function newCtx(tab = TAB): PanelToolCtx {
+  return makePanelToolCtx(bridge, tab, new WorkflowTargetStore());
 }
 
-async function connected(opts: { holdRuns?: boolean; holdRead?: string } = {}): Promise<ScriptedPanel> {
-  const sock = await connectPanel();
+async function connected(opts: PanelOpts = {}, tab = TAB): Promise<ScriptedPanel> {
+  const sock = await connectPanel(tab);
   const panel = attachPanel(sock, opts);
-  await waitFor(() => expect(bridge.canReach(TAB)).toBe(true));
+  await waitFor(() => expect(bridge.canReach(tab)).toBe(true));
   return panel;
 }
 
@@ -301,6 +404,21 @@ async function firstOf(
   ]);
 }
 
+/** A session whose graph_set_widget reply window is shrunk so a held write times out. */
+function slowWriteCtx(): PanelToolCtx {
+  const ctx = newCtx();
+  const inner = ctx.call.bind(ctx);
+  ctx.call = (cmd, timeoutMs, onDispatchedRid, beforeDispatch, options) =>
+    inner(cmd, cmd.cmd === "graph_set_widget" ? 80 : timeoutMs, onDispatchedRid, beforeDispatch, options);
+  return ctx;
+}
+
+function tokenOf(res: ToolResult): string {
+  const token = /retry_of:"([^"]+)"/.exec(textOf(res))?.[1];
+  if (!token) throw new Error(`no retry_of token in: ${textOf(res)}`);
+  return token;
+}
+
 /** True once `p` has settled, without awaiting it. */
 function tracked<T>(p: Promise<T>): { promise: Promise<T>; settled: () => boolean } {
   let done = false;
@@ -318,6 +436,7 @@ beforeEach(async () => {
 });
 
 afterEach(async () => {
+  vi.restoreAllMocks();
   __panelToolsTestHooks.setRunFreshnessBarrierMs(null);
   __panelToolsTestHooks.setRunFreshnessWaitObserver(null);
   __panelToolsTestHooks.setOutstandingMutationReadSettleMs(null);
@@ -576,19 +695,12 @@ describe("panel_run observes earlier acknowledged mutations before serialization
     expect(textOf(res)).not.toMatch(/awaiting the panel's reply/);
   });
 
-  it("a timed-out edit settled by its own retry_of (reconciled, not re-applied twice) lets the run through", async () => {
+  it("an exact edit retry_of JOINS the still-running original in the panel ledger: one apply, settled, then the run proceeds", async () => {
     __panelToolsTestHooks.setOutstandingMutationReadSettleMs(40);
-    const panel = await connected();
-    // The first write's reply window is shrunk so it times out while held.
-    const slow = newCtx();
-    const inner = slow.call.bind(slow);
-    slow.call = (cmd, timeoutMs, onDispatchedRid, beforeDispatch, options) =>
-      inner(cmd, cmd.cmd === "graph_set_widget" ? 80 : timeoutMs, onDispatchedRid, beforeDispatch, options);
-
-    const first = await setWidget(slow, SAVE_NODE, "filename_prefix", NEW.filename_prefix);
+    const panel = await connected({ ledger: true });
+    const first = await setWidget(slowWriteCtx(), SAVE_NODE, "filename_prefix", NEW.filename_prefix);
     expect(first.isError).toBe(true);
-    const token = /retry_of:"([^"]+)"/.exec(textOf(first))?.[1];
-    expect(token).toBeTruthy();
+    const token = tokenOf(first);
     expect((await panelRun(newCtx())).isError, "outcome-unknown edit must refuse the run").toBe(true);
     expect(panel.runs).toHaveLength(0);
 
@@ -597,18 +709,64 @@ describe("panel_run observes earlier acknowledged mutations before serialization
       { node_id: SAVE_NODE, widget: "filename_prefix", value: NEW.filename_prefix, retry_of: token } as never,
       ctx,
     );
-    await panel.writesArrived(2);
-    expect(panel.writes[1]?.msg.retry_of).toBe(token);
-    panel.writes[1]?.release();
-    expect((await retry).isError).not.toBe(true);
-    expect(bridge.mutationSettlement(token as string)).toBe("settled");
+    // The panel's ledger joined the retry onto the running original: nothing new executed.
+    await waitFor(() => expect(panel.ledgerAnswers).toBe(1));
+    expect(panel.writes).toHaveLength(1);
+    panel.writes[0]?.release(); // the ORIGINAL completes; the joined retry gets its reply
+    expect((await retry).isError, "retry answered with the original's outcome").not.toBe(true);
+    expect(panel.applyCount, "applied once, never twice").toBe(1);
+    await waitFor(() => expect(bridge.mutationSettlement(token)).toBe("settled"));
 
     const barrier = observeBarrier();
     const res = await panelRun(ctx);
-    expect(barrier.calls, "a reconciled edit is settled: no wait").toEqual([]);
+    expect(barrier.calls, "a settled edit: no wait").toEqual([]);
     expect(res.isError, textOf(res)).not.toBe(true);
     expect(panel.runs).toHaveLength(1);
     expect(panel.runs[0]?.serialized.filename_prefix).toBe(NEW.filename_prefix);
+    expect(panel.applyCount).toBe(1);
+  });
+
+  it("the ledger's STILL-RUNNING duplicate reply does not settle the edit: the run stays refused until the original answers", async () => {
+    __panelToolsTestHooks.setOutstandingMutationReadSettleMs(40);
+    const panel = await connected({ ledger: true, duplicateBudgetMs: 30 });
+    const first = await setWidget(slowWriteCtx(), SAVE_NODE, "filename_prefix", NEW.filename_prefix);
+    const token = tokenOf(first);
+
+    const retry = await defByName("panel_set_widget").handler(
+      { node_id: SAVE_NODE, widget: "filename_prefix", value: NEW.filename_prefix, retry_of: token } as never,
+      newCtx(),
+    );
+    expect(retry.isError).toBe(true);
+    expect(textOf(retry)).toMatch(/STILL RUNNING/);
+    expect(bridge.mutationSettlement(token)).toBe("unknown");
+    expect((await panelRun(newCtx())).isError).toBe(true);
+    expect(panel.runs).toHaveLength(0);
+
+    panel.writes[0]?.release(); // the original's late reply is its definite outcome
+    await waitFor(() => expect(bridge.mutationSettlement(token)).toBe("settled"));
+    const res = await panelRun(newCtx());
+    expect(res.isError, textOf(res)).not.toBe(true);
+    expect(panel.runs).toHaveLength(1);
+    expect(panel.applyCount).toBe(1);
+  });
+
+  it("a non-error but NON-TERMINAL retry reply (parked until idle) does not settle the edit", async () => {
+    __panelToolsTestHooks.setOutstandingMutationReadSettleMs(40);
+    const panel = await connected({ deferUnknownRetry: true });
+    const first = await setWidget(slowWriteCtx(), SAVE_NODE, "filename_prefix", NEW.filename_prefix);
+    const token = tokenOf(first);
+
+    const retry = await defByName("panel_set_widget").handler(
+      { node_id: SAVE_NODE, widget: "filename_prefix", value: NEW.filename_prefix, retry_of: token } as never,
+      newCtx(),
+    );
+    expect(textOf(retry)).toContain("waiting_for_queue_idle");
+    expect(panel.applyCount).toBe(0);
+    expect(bridge.mutationSettlement(token), "a parked edit is not an applied one").toBe("unknown");
+    const res = await panelRun(newCtx());
+    expect(res.isError).toBe(true);
+    expect(textOf(res)).toContain(`retry_of:"${token}"`);
+    expect(panel.runs).toHaveLength(0);
   });
 });
 
@@ -767,9 +925,12 @@ describe("panel_run freshness barrier never releases onto a different graph (#29
 });
 
 describe("panel_run retry_of of an outcome-unknown ORIGINAL run while edits are pending (#2955)", () => {
-  async function uncertainOriginalRun(panel: ScriptedPanel): Promise<{ token: string; ctx: PanelToolCtx }> {
+  async function uncertainOriginalRun(
+    panel: ScriptedPanel,
+    tab = TAB,
+  ): Promise<{ token: string; ctx: PanelToolCtx }> {
     __panelToolsTestHooks.setRunLateAckGraceMs(0);
-    const ctx = newCtx();
+    const ctx = newCtx(tab);
     const inner = ctx.call.bind(ctx);
     ctx.call = (cmd, timeoutMs, onDispatchedRid, beforeDispatch, options) =>
       inner(cmd, cmd.cmd === "graph_run" ? 80 : timeoutMs, onDispatchedRid, beforeDispatch, options);
@@ -806,7 +967,8 @@ describe("panel_run retry_of of an outcome-unknown ORIGINAL run while edits are 
     await write;
   });
 
-  it("an original whose late ack has landed reconciles from its receipt even with an edit pending — no duplicate prompt", async () => {
+  it("an original whose late ack has landed gets NO shortcut while an edit is pending; it reconciles locally once the edit settles — one graph_run ever", async () => {
+    __panelToolsTestHooks.setRunFreshnessBarrierMs(120);
     const panel = await connected({ holdRuns: true });
     const { token, ctx } = await uncertainOriginalRun(panel);
     panel.releaseRun(0);
@@ -814,17 +976,228 @@ describe("panel_run retry_of of an outcome-unknown ORIGINAL run while edits are 
 
     const write = setWidget(ctx, SAVE_NODE, "filename_prefix", NEW.filename_prefix);
     await panel.writesArrived(1);
-    const barrier = observeBarrier();
-    const res = await panelRun(ctx, { retry_of: token });
-
-    expect(res.isError, textOf(res)).not.toBe(true);
-    expect(barrier.calls, "reconciliation is not a new serialization").toEqual([]);
-    expect(panel.runs, "exactly one graph_run ever reached the panel").toHaveLength(1);
-    expect(textOf(res)).toContain("p-2955-1");
-    expect(RunCompletions.ticketFor("p-2955-1")).toBeDefined();
+    const refused = await panelRun(ctx, { retry_of: token });
+    expect(refused.isError).toBe(true);
+    expect(textOf(refused)).toContain(`panel_run (retry_of:"${token}") was NOT dispatched`);
+    expect(textOf(refused)).toContain(`the SAME retry_of:"${token}"`);
+    expect(panel.runs, "no new submission").toHaveLength(1);
 
     panel.writes[0]?.release();
+    expect((await write).isError).not.toBe(true);
+    const res = await panelRun(ctx, { retry_of: token });
+    expect(res.isError, textOf(res)).not.toBe(true);
+    expect(textOf(res)).toContain("p-2955-1");
+    expect(panel.runs, "answered from the retained receipt, not re-sent").toHaveLength(1);
+    expect(RunCompletions.ticketFor("p-2955-1")).toBeDefined();
+  });
+
+  it("a prompt-receipt-only original (no reply body) + a pending edit: the retry is refused with the original's token — no new graph_run", async () => {
+    __panelToolsTestHooks.setRunFreshnessBarrierMs(120);
+    const panel = await connected({ holdRuns: true });
+    const { token, ctx } = await uncertainOriginalRun(panel);
+    panel.sock.send(JSON.stringify({ type: "run_receipt", run_rid: token, prompt_id: "p-receipt-only" }));
+    // The exact late prompt receipt is reconciled by the bounded handoff (ticket),
+    // but there is no retained reply body for the run.
+    await waitFor(() => expect(RunCompletions.ticketFor("p-receipt-only")).toBeDefined());
+    expect(bridge.peekLateMutation(token)).toBeUndefined();
+
+    const write = setWidget(ctx, SAVE_NODE, "filename_prefix", NEW.filename_prefix);
+    await panel.writesArrived(1);
+    const res = await panelRun(ctx, { retry_of: token });
+    expect(res.isError).toBe(true);
+    expect(textOf(res)).toContain(`panel_run (retry_of:"${token}") was NOT dispatched`);
+    expect(textOf(res)).toMatch(/Do NOT re-run panel_run without retry_of/);
+    expect(panel.runs, "a prompt receipt alone must not unlock a fresh graph_run").toHaveLength(1);
+    panel.writes[0]?.release();
     await write;
+  });
+
+  it("a retry_of naming a DIFFERENT batch or branch is refused while edits are pending, and is never answered from the original's receipt", async () => {
+    __panelToolsTestHooks.setRunFreshnessBarrierMs(120);
+    const panel = await connected({ holdRuns: true, ledger: true });
+    const { token, ctx } = await uncertainOriginalRun(panel);
+    panel.releaseRun(0);
+    await waitFor(() => expect(bridge.peekLateMutation(token)).toBeDefined());
+
+    const write = setWidget(ctx, SAVE_NODE, "filename_prefix", NEW.filename_prefix);
+    await panel.writesArrived(1);
+    for (const changed of [{ batch_count: 3 }, { to_node_id: SAVE_NODE }]) {
+      const res = await panelRun(ctx, { ...changed, retry_of: token });
+      expect(res.isError).toBe(true);
+      expect(textOf(res)).toContain(`the SAME retry_of:"${token}"`);
+    }
+    expect(panel.runs).toHaveLength(1);
+    panel.writes[0]?.release();
+    await write;
+
+    // Nothing pending now. The token names ONE single-batch full run; a 3-batch
+    // retry is a different run and must not inherit its outcome.
+    const other = await panelRun(ctx, { batch_count: 3, retry_of: token });
+    expect(other.isError).toBe(true);
+    expect(textOf(other)).toMatch(/different command or workflow/);
+    expect(textOf(other)).not.toContain("p-2955-1");
+    expect(panel.runs, "the panel's ledger refused it before executing").toHaveLength(1);
+  });
+
+  it("a token from ANOTHER tab's run while this tab has an edit pending is refused — no submission on either tab", async () => {
+    __panelToolsTestHooks.setRunFreshnessBarrierMs(120);
+    const panel = await connected();
+    const other = await connected({ holdRuns: true }, TAB2);
+    const { token } = await uncertainOriginalRun(other, TAB2);
+
+    const ctx = newCtx();
+    const write = setWidget(ctx, SAVE_NODE, "filename_prefix", NEW.filename_prefix);
+    await panel.writesArrived(1);
+    const res = await panelRun(ctx, { retry_of: token });
+    expect(res.isError).toBe(true);
+    expect(textOf(res)).toContain(`retry_of:"${token}"`);
+    expect(panel.runs).toHaveLength(0);
+    expect(other.runs).toHaveLength(1);
+    panel.writes[0]?.release();
+    await write;
+  });
+});
+
+describe("panel_run never reads forgotten receipt history as freshness (#2955)", () => {
+  it("TTL keeps an awaiting write discoverable and turns an unknown one into uncertainty — zero graph_run until both settle", async () => {
+    const panel = await connected();
+    const lost = await bridge
+      .send(
+        { cmd: "graph_set_widget", node_id: SAVE_NODE, widget: "filename_prefix", value: NEW.filename_prefix },
+        { tabId: TAB, timeoutMs: 40 },
+      )
+      .then(
+        () => "acked",
+        () => "timed out",
+      );
+    expect(lost).toBe("timed out");
+    const uRid = bridge.listOutstandingMutations(TAB)[0]?.rid as string;
+    const awaited = bridge.send(
+      { cmd: "graph_set_widget", node_id: PROMPT_NODE, widget: "text", value: NEW.text },
+      { tabId: TAB, timeoutMs: 60_000 },
+    );
+    await panel.writesArrived(2);
+
+    // Eleven minutes later: past the bridge's ten-minute receipt TTL.
+    const realNow = Date.now.bind(Date);
+    vi.spyOn(Date, "now").mockImplementation(() => realNow() + 11 * 60_000);
+    __panelToolsTestHooks.setRunFreshnessBarrierMs(80);
+    const refused = await panelRun(newCtx());
+    expect(refused.isError).toBe(true);
+    expect(panel.runs).toHaveLength(0);
+    expect(bridge.listAwaitedMutations(TAB), "the awaited write is never evicted").toHaveLength(1);
+    expect(bridge.listUncertainTargets(TAB)).toEqual([
+      expect.objectContaining({ tabId: TAB, count: 1, rids: [uRid], cmds: ["graph_set_widget"] }),
+    ]);
+    expect(bridge.mutationSettlement(uRid)).toBe("unknown");
+    expect(textOf(refused)).toMatch(/dropped from the bridge's bounded receipt memory/);
+    expect(textOf(refused)).toContain(`retry_of:"${uRid}"`);
+    expect(textOf(refused)).toMatch(/awaiting the panel's reply/);
+
+    panel.writes[1]?.release();
+    await awaited;
+    panel.writes[0]?.release(); // the evicted write's late reply: its definite outcome
+    await waitFor(() => expect(bridge.listUncertainTargets(TAB)).toEqual([]));
+    expect(bridge.mutationSettlement(uRid)).toBe("settled");
+    const res = await panelRun(newCtx());
+    expect(res.isError, textOf(res)).not.toBe(true);
+    expect(panel.runs).toHaveLength(1);
+    expect(panel.runs[0]?.serialized).toEqual(NEW);
+  });
+
+  it("an evicted uncertainty is reconciled only by the SAME command's terminal retry_of", async () => {
+    __panelToolsTestHooks.setOutstandingMutationReadSettleMs(40);
+    const panel = await connected({ ledger: true });
+    const first = await setWidget(slowWriteCtx(), SAVE_NODE, "filename_prefix", NEW.filename_prefix);
+    const token = tokenOf(first);
+    const realNow = Date.now.bind(Date);
+    vi.spyOn(Date, "now").mockImplementation(() => realNow() + 11 * 60_000);
+    expect(bridge.listUncertainTargets(TAB)[0]?.rids).toEqual([token]);
+    expect(bridge.peekDeliveredMutation(token), "the full receipt itself is gone").toBeUndefined();
+
+    expect(
+      bridge.markMutationReconciled(token, {
+        cmd: "graph_set_widget",
+        node_id: SAVE_NODE,
+        widget: "filename_prefix",
+        value: "a different value",
+      }),
+      "a different command cannot resolve it",
+    ).toBe(false);
+    expect((await panelRun(newCtx())).isError).toBe(true);
+
+    const retry = defByName("panel_set_widget").handler(
+      { node_id: SAVE_NODE, widget: "filename_prefix", value: NEW.filename_prefix, retry_of: token } as never,
+      newCtx(),
+    );
+    await waitFor(() => expect(panel.ledgerAnswers).toBe(1));
+    panel.writes[0]?.release();
+    expect((await retry).isError).not.toBe(true);
+    await waitFor(() => expect(bridge.listUncertainTargets(TAB)).toEqual([]));
+    const res = await panelRun(newCtx());
+    expect(res.isError, textOf(res)).not.toBe(true);
+    expect(panel.runs).toHaveLength(1);
+    expect(panel.applyCount).toBe(1);
+  });
+
+  it("capacity overflow on another tab cannot evict this tab's awaiting write; the overflowed tab keeps its uncertainty until its browser tab is retired", async () => {
+    __panelToolsTestHooks.setRunFreshnessBarrierMs(80);
+    __panelToolsTestHooks.setOutstandingMutationReadSettleMs(40);
+    bridge.setTabGoneListener(() => {}, { graceMs: 60_000 });
+    const panel = await connected();
+    const other = await connected({ dropCmd: "graph_move_node" }, TAB2);
+
+    const held = bridge.send(
+      { cmd: "graph_set_widget", node_id: SAVE_NODE, widget: "filename_prefix", value: NEW.filename_prefix },
+      { tabId: TAB, timeoutMs: 60_000 },
+    );
+    await panel.writesArrived(1);
+    // 300 mutations on the other tab whose replies are lost: more receipts than the cache keeps.
+    await Promise.all(
+      Array.from({ length: 300 }, (_, i) =>
+        bridge
+          .send({ cmd: "graph_move_node", node_id: i + 1, pos: [0, 0] }, { tabId: TAB2, timeoutMs: 30 })
+          .catch(() => undefined),
+      ),
+    );
+    expect(other.dropped).toHaveLength(300);
+    expect(bridge.listAwaitedMutations(TAB), "this tab's held write is still discoverable").toHaveLength(1);
+    const evicted = bridge.listUncertainTargets(TAB2);
+    expect(evicted).toHaveLength(1);
+    expect(evicted[0]?.count).toBeGreaterThan(0);
+    expect(
+      (evicted[0]?.count ?? 0) + bridge.listUnsettledMutations(TAB2).length,
+      "every unresolved outcome is accounted for — compacted, not dropped",
+    ).toBe(300);
+    expect(evicted[0]?.rids.length).toBeLessThan(evicted[0]?.count ?? 0);
+
+    const here = await panelRun(newCtx());
+    expect(here.isError).toBe(true);
+    expect(textOf(here)).toMatch(/awaiting the panel's reply/);
+    expect(panel.runs).toHaveLength(0);
+    const there = await panelRun(newCtx(TAB2));
+    expect(there.isError).toBe(true);
+    expect(textOf(there)).toMatch(/bounded receipt memory/);
+    expect(textOf(there)).toMatch(/not individually tracked/);
+    expect(other.runs).toHaveLength(0);
+
+    panel.writes[0]?.release();
+    await held;
+    const ok = await panelRun(newCtx());
+    expect(ok.isError, textOf(ok)).not.toBe(true);
+    expect(panel.runs).toHaveLength(1);
+
+    // Identity retirement: that browser tab closed and did not return within its grace.
+    other.sock.close();
+    await waitFor(() => expect(bridge.canReach(TAB2)).toBe(false));
+    expect(bridge.listUncertainTargets(TAB2)).toHaveLength(1);
+    bridge.__runTabGoneClocksForTest();
+    expect(bridge.listUncertainTargets(TAB2)).toEqual([]);
+    expect(bridge.listUnsettledMutations(TAB2)).toEqual([]);
+    const again = await connected({}, TAB2);
+    const fresh = await panelRun(newCtx(TAB2));
+    expect(fresh.isError, textOf(fresh)).not.toBe(true);
+    expect(again.runs).toHaveLength(1);
   });
 });
 
