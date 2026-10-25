@@ -104,7 +104,7 @@ function viewing() {
     scope: "root",
     kind: "root",
     workflow: "chizu_scout.json",
-    workflow_uuid: WORKFLOW_UUID,
+    workflow_uuid: workflowUuid,
     graph_identity: "graph:root-2955",
   };
 }
@@ -117,6 +117,9 @@ type PanelOpts = {
   holdRead?: string;
   /** Never answer this command (its reply is lost; the bridge times it out). */
   dropCmd?: string;
+  /** Lose only the FIRST frame of this command before the panel sees it (it never
+   *  runs, so the ledger never learns its rid); later frames are handled normally. */
+  dropFirst?: string;
   /**
    * Model the panel's rid ledger (#517/#694, comfyui-mcp-panel command-dedupe):
    * a retry_of whose original the ledger holds with the SAME fingerprint is
@@ -189,8 +192,27 @@ function attachPanel(sock: WebSocket, opts: PanelOpts = {}): ScriptedPanel {
   const writeLedger = new Map<string, Entry>();
   const runLedger = new Map<string, Entry>();
   const send = (frame: Record<string, unknown>) => sock.send(JSON.stringify(frame));
-  const writeFp = (m: Record<string, unknown>) => JSON.stringify([m.node_id, m.widget, m.value]);
-  const runFp = (m: Record<string, unknown>) => JSON.stringify([m.batch_count ?? 1, m.to_node_id ?? null]);
+  // The panel's commandFingerprint (lib/command-dedupe.js): the whole frame minus rid
+  // and retry_of, key-order independent — the workflow stamp, every argument AND
+  // timeout_ms are part of it. A positive join therefore needs the retry to carry the
+  // original's timeout, as production's caller-requested timeout does (#2559).
+  const canon = (v: unknown): unknown =>
+    Array.isArray(v)
+      ? v.map(canon)
+      : v && typeof v === "object"
+        ? Object.fromEntries(
+            Object.keys(v as Record<string, unknown>)
+              .sort()
+              .map((k) => [k, canon((v as Record<string, unknown>)[k])]),
+          )
+        : v;
+  const fingerprint = (m: Record<string, unknown>) => {
+    const { rid: _rid, retry_of: _retryOf, ...rest } = m;
+    return JSON.stringify(canon(rest));
+  };
+  const writeFp = fingerprint;
+  const runFp = fingerprint;
+  const droppedFirst = new Set<string>();
   const settleEntry = (entry: Entry | undefined, reply: Record<string, unknown>) => {
     if (!entry) return;
     entry.reply = reply;
@@ -234,6 +256,11 @@ function attachPanel(sock: WebSocket, opts: PanelOpts = {}): ScriptedPanel {
     if (typeof msg.rid !== "string" || typeof msg.cmd !== "string") return;
     const rid = msg.rid;
     if (opts.dropCmd && msg.cmd === opts.dropCmd) {
+      dropped.push(msg);
+      return;
+    }
+    if (opts.dropFirst && msg.cmd === opts.dropFirst && !droppedFirst.has(msg.cmd)) {
+      droppedFirst.add(msg.cmd);
       dropped.push(msg);
       return;
     }
@@ -405,11 +432,17 @@ async function firstOf(
 }
 
 /** A session whose graph_set_widget reply window is shrunk so a held write times out. */
-function slowWriteCtx(): PanelToolCtx {
-  const ctx = newCtx();
+function slowWriteCtx(writeTimeoutMs = 300, tab = TAB): PanelToolCtx {
+  const ctx = newCtx(tab);
   const inner = ctx.call.bind(ctx);
   ctx.call = (cmd, timeoutMs, onDispatchedRid, beforeDispatch, options) =>
-    inner(cmd, cmd.cmd === "graph_set_widget" ? 80 : timeoutMs, onDispatchedRid, beforeDispatch, options);
+    inner(
+      cmd,
+      cmd.cmd === "graph_set_widget" ? writeTimeoutMs : timeoutMs,
+      onDispatchedRid,
+      beforeDispatch,
+      options,
+    );
   return ctx;
 }
 
@@ -704,7 +737,7 @@ describe("panel_run observes earlier acknowledged mutations before serialization
     expect((await panelRun(newCtx())).isError, "outcome-unknown edit must refuse the run").toBe(true);
     expect(panel.runs).toHaveLength(0);
 
-    const ctx = newCtx();
+    const ctx = slowWriteCtx(); // same caller-requested timeout as the original: same fingerprint
     const retry = defByName("panel_set_widget").handler(
       { node_id: SAVE_NODE, widget: "filename_prefix", value: NEW.filename_prefix, retry_of: token } as never,
       ctx,
@@ -734,7 +767,7 @@ describe("panel_run observes earlier acknowledged mutations before serialization
 
     const retry = await defByName("panel_set_widget").handler(
       { node_id: SAVE_NODE, widget: "filename_prefix", value: NEW.filename_prefix, retry_of: token } as never,
-      newCtx(),
+      slowWriteCtx(),
     );
     expect(retry.isError).toBe(true);
     expect(textOf(retry)).toMatch(/STILL RUNNING/);
@@ -1105,9 +1138,11 @@ describe("panel_run never reads forgotten receipt history as freshness (#2955)",
     expect(panel.runs[0]?.serialized).toEqual(NEW);
   });
 
-  it("an evicted uncertainty is reconciled only by the SAME command's terminal retry_of", async () => {
+  it("an evicted uncertainty is NOT cleared by any retry (its frame was not kept) — only by its own late reply", async () => {
     __panelToolsTestHooks.setOutstandingMutationReadSettleMs(40);
-    const panel = await connected({ ledger: true });
+    // No ledger: the panel holds no record of the original (fails open), so an
+    // exact-looking retry executes fresh and returns a terminal success.
+    const panel = await connected();
     const first = await setWidget(slowWriteCtx(), SAVE_NODE, "filename_prefix", NEW.filename_prefix);
     const token = tokenOf(first);
     const realNow = Date.now.bind(Date);
@@ -1115,29 +1150,27 @@ describe("panel_run never reads forgotten receipt history as freshness (#2955)",
     expect(bridge.listUncertainTargets(TAB)[0]?.rids).toEqual([token]);
     expect(bridge.peekDeliveredMutation(token), "the full receipt itself is gone").toBeUndefined();
 
-    expect(
-      bridge.markMutationReconciled(token, {
-        cmd: "graph_set_widget",
-        node_id: SAVE_NODE,
-        widget: "filename_prefix",
-        value: "a different value",
-      }),
-      "a different command cannot resolve it",
-    ).toBe(false);
-    expect((await panelRun(newCtx())).isError).toBe(true);
-
     const retry = defByName("panel_set_widget").handler(
       { node_id: SAVE_NODE, widget: "filename_prefix", value: NEW.filename_prefix, retry_of: token } as never,
       newCtx(),
     );
-    await waitFor(() => expect(panel.ledgerAnswers).toBe(1));
-    panel.writes[0]?.release();
-    expect((await retry).isError).not.toBe(true);
+    await panel.writesArrived(2);
+    panel.writes[1]?.release();
+    expect((await retry).isError, "the retry itself succeeded").not.toBe(true);
+    expect(bridge.listUncertainTargets(TAB)[0]?.rids, "…but proves nothing about the evicted original").toEqual([
+      token,
+    ]);
+    const refused = await panelRun(newCtx());
+    expect(refused.isError).toBe(true);
+    expect(textOf(refused)).toMatch(/does NOT clear them/);
+    expect(textOf(refused)).toContain(`retry_of:"${token}"`);
+    expect(panel.runs).toHaveLength(0);
+
+    panel.writes[0]?.release(); // the ORIGINAL's own late reply: its definite outcome
     await waitFor(() => expect(bridge.listUncertainTargets(TAB)).toEqual([]));
     const res = await panelRun(newCtx());
     expect(res.isError, textOf(res)).not.toBe(true);
     expect(panel.runs).toHaveLength(1);
-    expect(panel.applyCount).toBe(1);
   });
 
   it("capacity overflow on another tab cannot evict this tab's awaiting write; the overflowed tab keeps its uncertainty until its browser tab is retired", async () => {
@@ -1187,17 +1220,251 @@ describe("panel_run never reads forgotten receipt history as freshness (#2955)",
     expect(ok.isError, textOf(ok)).not.toBe(true);
     expect(panel.runs).toHaveLength(1);
 
-    // Identity retirement: that browser tab closed and did not return within its grace.
+    // The socket drops past its grace: that proves nothing about the document.
     other.sock.close();
     await waitFor(() => expect(bridge.canReach(TAB2)).toBe(false));
-    expect(bridge.listUncertainTargets(TAB2)).toHaveLength(1);
     bridge.__runTabGoneClocksForTest();
-    expect(bridge.listUncertainTargets(TAB2)).toEqual([]);
-    expect(bridge.listUnsettledMutations(TAB2)).toEqual([]);
-    const again = await connected({}, TAB2);
+    expect(bridge.listUncertainTargets(TAB2), "grace expiry is not settlement").toHaveLength(1);
+    // The SAME browser document comes back: its unknown edits still bind its runs.
+    const back = await connected({}, TAB2);
+    const stillRefused = await panelRun(newCtx(TAB2));
+    expect(stillRefused.isError).toBe(true);
+    expect(back.runs).toHaveLength(0);
+    back.sock.close();
+    await waitFor(() => expect(bridge.canReach(TAB2)).toBe(false));
+    // A DIFFERENT browser tab opens the same workflow under the same key: another
+    // in-memory graph, which the old document's edits cannot touch.
+    const otherDocument = attachPanel(await connectPanel(TAB2, "browser-tab-2955-second-document"));
+    await waitFor(() => expect(bridge.canReach(TAB2)).toBe(true));
     const fresh = await panelRun(newCtx(TAB2));
     expect(fresh.isError, textOf(fresh)).not.toBe(true);
-    expect(again.runs).toHaveLength(1);
+    expect(otherDocument.runs).toHaveLength(1);
+    expect(bridge.listUncertainTargets(TAB2), "…and the old document's uncertainty is kept").toHaveLength(1);
+  });
+
+  it("a surviving document that reconnects AFTER its grace still blocks runs until its edit's own outcome arrives", async () => {
+    __panelToolsTestHooks.setOutstandingMutationReadSettleMs(40);
+    bridge.setTabGoneListener(() => {}, { graceMs: 60_000 });
+    const panel = await connected();
+    const first = await setWidget(slowWriteCtx(), SAVE_NODE, "filename_prefix", NEW.filename_prefix);
+    const token = tokenOf(first);
+
+    panel.sock.close();
+    await waitFor(() => expect(bridge.canReach(TAB)).toBe(false));
+    bridge.__runTabGoneClocksForTest(); // declared gone — but the document is still alive
+    const revived = await connectPanel(); // same tab_session_id: the same document
+    const back = attachPanel(revived);
+    await waitFor(() => expect(bridge.canReach(TAB)).toBe(true));
+
+    const refused = await panelRun(newCtx());
+    expect(refused.isError).toBe(true);
+    expect(textOf(refused)).toContain(`retry_of:"${token}"`);
+    expect(back.runs).toHaveLength(0);
+
+    // The original edit finishes in that document and its late reply arrives.
+    revived.send(
+      JSON.stringify({
+        rid: token,
+        ok: true,
+        result: { set: { node_id: SAVE_NODE, widget: "filename_prefix", previous: OLD.filename_prefix, value: NEW.filename_prefix } },
+      }),
+    );
+    await waitFor(() => expect(bridge.mutationSettlement(token)).toBe("settled"));
+    const res = await panelRun(newCtx());
+    expect(res.isError, textOf(res)).not.toBe(true);
+    expect(back.runs).toHaveLength(1);
+  });
+});
+
+describe("retry_of settles an unknown edit only on proven same-receiver, same-command evidence (#2955)", () => {
+  it("a same-widget/value retry answered on ANOTHER tab does not settle tab A's edit; A still blocks with its token", async () => {
+    __panelToolsTestHooks.setOutstandingMutationReadSettleMs(40);
+    const panel = await connected({ ledger: true });
+    const other = await connected({ ledger: true }, TAB2);
+    const first = await setWidget(slowWriteCtx(), SAVE_NODE, "filename_prefix", NEW.filename_prefix);
+    const token = tokenOf(first);
+    expect(bridge.peekDeliveredMutation(token)?.status).toBe("timed_out");
+
+    // The session was re-pointed at tab B. B's ledger never saw the original, fails
+    // open, and runs the replayed frame fresh: a terminal success — on B.
+    const retry = defByName("panel_set_widget").handler(
+      { node_id: SAVE_NODE, widget: "filename_prefix", value: NEW.filename_prefix, retry_of: token } as never,
+      newCtx(TAB2),
+    );
+    await other.writesArrived(1);
+    expect(other.writes[0]?.msg.retry_of).toBe(token);
+    other.writes[0]?.release();
+    expect((await retry).isError).not.toBe(true);
+    expect(other.applyCount).toBe(1);
+
+    expect(bridge.mutationSettlement(token), "B's answer is not A's outcome").toBe("unknown");
+    const res = await panelRun(newCtx());
+    expect(res.isError).toBe(true);
+    expect(textOf(res)).toContain(`that edit's own token retry_of:"${token}"`);
+    expect(panel.runs).toHaveLength(0);
+    expect(panel.applyCount, "the original on A is still held, never applied").toBe(0);
+  });
+
+  it("an EVICTED original's retry on another tab cannot clear A's marker either", async () => {
+    __panelToolsTestHooks.setOutstandingMutationReadSettleMs(40);
+    const panel = await connected({ ledger: true });
+    const other = await connected({ ledger: true }, TAB2);
+    const first = await setWidget(slowWriteCtx(), SAVE_NODE, "filename_prefix", NEW.filename_prefix);
+    const token = tokenOf(first);
+    const realNow = Date.now.bind(Date);
+    vi.spyOn(Date, "now").mockImplementation(() => realNow() + 11 * 60_000);
+    expect(bridge.listUncertainTargets(TAB)[0]?.rids).toEqual([token]);
+
+    const retry = defByName("panel_set_widget").handler(
+      { node_id: SAVE_NODE, widget: "filename_prefix", value: NEW.filename_prefix, retry_of: token } as never,
+      newCtx(TAB2),
+    );
+    await other.writesArrived(1);
+    other.writes[0]?.release();
+    expect((await retry).isError).not.toBe(true);
+
+    expect(bridge.listUncertainTargets(TAB)[0]?.rids).toEqual([token]);
+    const res = await panelRun(newCtx());
+    expect(res.isError).toBe(true);
+    expect(textOf(res)).toContain(`retry_of:"${token}"`);
+    expect(panel.runs).toHaveLength(0);
+  });
+
+  it("the same tab under a DIFFERENT workflow cannot settle the old workflow's edit", async () => {
+    __panelToolsTestHooks.setOutstandingMutationReadSettleMs(40);
+    // No ledger (an old or reset panel): a retry always executes fresh.
+    const panel = await connected();
+    const first = await setWidget(slowWriteCtx(), SAVE_NODE, "filename_prefix", NEW.filename_prefix);
+    const token = tokenOf(first);
+    expect(bridge.peekDeliveredMutation(token)?.frame.workflow_uuid).toBe(WORKFLOW_UUID);
+
+    workflowUuid = "44444444-4444-4444-8444-444444444444";
+    const retry = defByName("panel_set_widget").handler(
+      { node_id: SAVE_NODE, widget: "filename_prefix", value: NEW.filename_prefix, retry_of: token } as never,
+      newCtx(),
+    );
+    await panel.writesArrived(2);
+    expect(panel.writes[1]?.msg.workflow_uuid).toBe("44444444-4444-4444-8444-444444444444");
+    panel.writes[1]?.release();
+    expect((await retry).isError).not.toBe(true);
+    expect(bridge.mutationSettlement(token), "another workflow's write is another command").toBe("unknown");
+
+    workflowUuid = WORKFLOW_UUID; // back on the original workflow (A-B-A)
+    const res = await panelRun(newCtx());
+    expect(res.isError).toBe(true);
+    expect(textOf(res)).toContain(`retry_of:"${token}"`);
+    expect(panel.runs).toHaveLength(0);
+  });
+
+  it("a non-widget retry with different effective args (same node) does not settle; the identical frame does", async () => {
+    __panelToolsTestHooks.setOutstandingMutationReadSettleMs(40);
+    const panel = await connected({ dropFirst: "graph_move_node" });
+    const lost = await bridge
+      .send({ cmd: "graph_move_node", node_id: 4, pos: [0, 0] }, { tabId: TAB, timeoutMs: 40 })
+      .then(
+        () => "acked",
+        () => "timed out",
+      );
+    expect(lost).toBe("timed out");
+    const original = bridge.listOutstandingMutations(TAB)[0]?.rid as string;
+    const retryRid = async (frame: Record<string, unknown>): Promise<string> => {
+      let rid = "";
+      await bridge.send(frame as { cmd: string }, {
+        tabId: TAB,
+        timeoutMs: 5000,
+        onDispatchedRid: (r) => {
+          rid = r;
+        },
+      });
+      return rid;
+    };
+
+    // Same command name and node — what a cmd/node/widget/value hash would equate.
+    const moved = await retryRid({ cmd: "graph_move_node", node_id: 4, pos: [7, 7], retry_of: original });
+    expect(bridge.markMutationReconciled(original, moved), "a different position is a different command").toBe(false);
+    expect(bridge.mutationSettlement(original)).toBe("unknown");
+    expect((await panelRun(newCtx())).isError).toBe(true);
+    expect(panel.runs).toHaveLength(0);
+
+    // Positive control: the identical frame, same tab, same connection.
+    const same = await retryRid({ cmd: "graph_move_node", node_id: 4, pos: [0, 0], retry_of: original });
+    expect(bridge.markMutationReconciled(original, same)).toBe(true);
+    expect(bridge.mutationSettlement(original)).toBe("settled");
+    const res = await panelRun(newCtx());
+    expect(res.isError, textOf(res)).not.toBe(true);
+    expect(panel.runs).toHaveLength(1);
+  });
+
+  it("a retry whose frame differs from the original only in timeout_ms is a different fingerprint: rejected, nothing settles", async () => {
+    __panelToolsTestHooks.setOutstandingMutationReadSettleMs(40);
+    const panel = await connected({ ledger: true });
+    const first = await setWidget(slowWriteCtx(), SAVE_NODE, "filename_prefix", NEW.filename_prefix);
+    const token = tokenOf(first);
+    const retry = await defByName("panel_set_widget").handler(
+      { node_id: SAVE_NODE, widget: "filename_prefix", value: NEW.filename_prefix, retry_of: token } as never,
+      newCtx(), // the tool's own 90 s timeout, not the original's
+    );
+    expect(retry.isError).toBe(true);
+    expect(textOf(retry)).toMatch(/different command or workflow/);
+    expect(bridge.mutationSettlement(token)).toBe("unknown");
+    expect((await panelRun(newCtx())).isError).toBe(true);
+    expect(panel.runs).toHaveLength(0);
+    expect(panel.applyCount).toBe(0);
+  });
+
+  it("an explicit applied:\"unknown\" retry reply settles nothing, even with a set object", async () => {
+    __panelToolsTestHooks.setOutstandingMutationReadSettleMs(40);
+    const panel = await connected({ dropFirst: "graph_set_widget" });
+    const first = await setWidget(slowWriteCtx(), SAVE_NODE, "filename_prefix", NEW.filename_prefix);
+    const token = tokenOf(first);
+    panel.sock.on("message", (buf) => {
+      const msg = JSON.parse(buf.toString()) as Record<string, unknown>;
+      if (msg.cmd !== "graph_set_widget" || msg.retry_of !== token) return;
+      // Answer before the scripted handler does: an applied-unknown reply carrying a set.
+      panel.sock.send(
+        JSON.stringify({
+          rid: msg.rid,
+          ok: true,
+          result: {
+            applied: "unknown",
+            set: { node_id: SAVE_NODE, widget: "filename_prefix", previous: OLD.filename_prefix, value: NEW.filename_prefix },
+          },
+        }),
+      );
+    });
+    const retry = await defByName("panel_set_widget").handler(
+      { node_id: SAVE_NODE, widget: "filename_prefix", value: NEW.filename_prefix, retry_of: token } as never,
+      newCtx(),
+    );
+    expect(textOf(retry)).toContain("unknown");
+    expect(bridge.mutationSettlement(token)).toBe("unknown");
+    expect((await panelRun(newCtx())).isError).toBe(true);
+    expect(panel.runs).toHaveLength(0);
+  });
+
+  it("positive control: an original LOST before the panel saw it is settled by its exact retry on the same tab", async () => {
+    __panelToolsTestHooks.setOutstandingMutationReadSettleMs(40);
+    const panel = await connected({ ledger: true, dropFirst: "graph_set_widget" });
+    const first = await setWidget(slowWriteCtx(), SAVE_NODE, "filename_prefix", NEW.filename_prefix);
+    const token = tokenOf(first);
+    expect(panel.dropped).toHaveLength(1);
+
+    const retry = defByName("panel_set_widget").handler(
+      { node_id: SAVE_NODE, widget: "filename_prefix", value: NEW.filename_prefix, retry_of: token } as never,
+      slowWriteCtx(),
+    );
+    await panel.writesArrived(1);
+    panel.writes[0]?.release();
+    expect((await retry).isError).not.toBe(true);
+    expect(bridge.mutationSettlement(token)).toBe("settled");
+
+    const barrier = observeBarrier();
+    const res = await panelRun(newCtx());
+    expect(barrier.calls).toEqual([]);
+    expect(res.isError, textOf(res)).not.toBe(true);
+    expect(panel.runs).toHaveLength(1);
+    expect(panel.runs[0]?.serialized.filename_prefix).toBe(NEW.filename_prefix);
+    expect(panel.applyCount).toBe(1);
   });
 });
 

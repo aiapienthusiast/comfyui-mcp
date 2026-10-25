@@ -15,7 +15,7 @@
 // or `{ rid, ok: false, error }`. Frames WITHOUT a rid are panel-initiated
 // events (`hello`, `user_message`) and flow to `onPanelMessage`.
 
-import { createHash, randomUUID, timingSafeEqual } from "node:crypto";
+import { randomUUID, timingSafeEqual } from "node:crypto";
 import { WebSocketServer, WebSocket } from "ws";
 import { resolveLocale, trFor, type Locale } from "../i18n/index.js";
 import { logger } from "../utils/logger.js";
@@ -2060,6 +2060,8 @@ export type DeliveredMutationReceipt = {
   ts: number;
   frame: Record<string, unknown>;
   status: "in_flight" | "timed_out";
+  /** #2955 — the connection incarnation (browser document) the frame was written to. */
+  incarnation?: string;
 };
 
 /** #2955 — how far a delivered mutation's outcome is known (see mutationSettlement). */
@@ -2068,22 +2070,37 @@ export type MutationSettlement = "settled" | "awaiting" | "unknown";
 /** #2955 — a delivered mutation whose outcome is not yet definite. */
 export type UnsettledMutation = DeliveredMutationReceipt & { settlement: "awaiting" | "unknown" };
 
+/** #2955 — a definite outcome, plus — when the panel answered THIS rid with ok —
+ *  the exact command and receiver it answered for (see markMutationReconciled). */
+type SettledMutation = {
+  tabId: string;
+  ts: number;
+  answeredOk?: { incarnation?: string; key?: string };
+};
+
 /** #2955 — the marker key that applies to every tab (marker-capacity overflow). */
 export const ALL_TABS_UNCERTAINTY = "*";
 
 /**
  * #2955 — unknown-outcome receipts the bridge had to forget (TTL or capacity),
  * compacted for one canonical tab. `count` is how many were evicted and are
- * still unresolved; `rids` tracks up to MAX_UNCERTAIN_RIDS of them with an
- * identity hash of the command, so a late reply or an exact retry_of can
- * resolve them one by one. Untracked ones (count > rids.size) can only be
- * cleared by retiring the tab's incarnation.
+ * still unresolved; `rids` tracks up to MAX_UNCERTAIN_RIDS of them so each one's
+ * OWN late reply can resolve it. The evicted frame is not kept, so nothing else
+ * can prove a retry was the same command on the same target: a retry_of never
+ * clears a marker, and neither does a disconnect: untracked ones (count >
+ * rids.size) never clear in this process. They bind only runs on the same
+ * browser document (or any, when that is unknown/anonymous).
  */
 type EvictedUncertainty = {
+  /** Canonical tab id, or ALL_TABS_UNCERTAINTY. */
+  tab: string;
+  /** The browser document (connection incarnation) that received them; absent =
+   *  unknown or merged, i.e. it applies to every document on the tab. */
+  incarnation?: string;
   workflowUuids: Set<string>;
   unstamped: boolean;
   count: number;
-  rids: Map<string, string>;
+  rids: Set<string>;
   cmds: Set<string>;
   since: number;
 };
@@ -2091,6 +2108,7 @@ type EvictedUncertainty = {
 /** #2955 — a read-only view of one uncertainty marker. */
 export type UncertainTarget = {
   tabId: string;
+  incarnation?: string;
   count: number;
   workflowUuids: string[];
   unstamped: boolean;
@@ -2099,15 +2117,32 @@ export type UncertainTarget = {
   since: number;
 };
 
-/** #2955 — the identity a receipt / retry must share to resolve one another. */
-export function mutationIdentityHash(frame: Record<string, unknown>): string {
-  let value: string;
+/**
+ * #2955 — the EXACT command a frame carried: every argument, including the
+ * trusted workflow stamp the bridge wrote, in a key-order-independent form.
+ * Only the bridge-owned correlation fields (`rid`, `retry_of`, `timeout_ms`)
+ * are left out — they differ between an original and its retry by design.
+ * Undefined means the frame cannot be represented exactly (not provable).
+ */
+export function exactFrameKey(frame: Record<string, unknown>): string | undefined {
+  const canon = (v: unknown): unknown => {
+    if (Array.isArray(v)) return v.map(canon);
+    if (v && typeof v === "object") {
+      const out: Record<string, unknown> = {};
+      for (const k of Object.keys(v as Record<string, unknown>).sort()) {
+        out[k] = canon((v as Record<string, unknown>)[k]);
+      }
+      return out;
+    }
+    return v;
+  };
   try {
-    value = JSON.stringify([frame.cmd, frame.node_id ?? null, frame.widget ?? null, frame.value ?? null]);
+    const { rid: _rid, retry_of: _retryOf, timeout_ms: _timeout, ...rest } = frame;
+    const key = JSON.stringify(canon(rest));
+    return typeof key === "string" ? key : undefined;
   } catch {
-    value = String(frame.cmd);
+    return undefined;
   }
-  return createHash("sha256").update(value).digest("hex").slice(0, 32);
 }
 
 /** Peek of a delivered mutation, including one that already settled late. */
@@ -2575,7 +2610,15 @@ export class UiBridge {
    */
   private deliveredMutations = new Map<
     string,
-    { cmd: string; tabId: string; ts: number; frame: Record<string, unknown>; status: "in_flight" | "timed_out" }
+    {
+      cmd: string;
+      tabId: string;
+      ts: number;
+      frame: Record<string, unknown>;
+      status: "in_flight" | "timed_out";
+      /** #2955 — the connection incarnation the frame was written to. */
+      incarnation?: string;
+    }
   >();
   /** Installed by the retry-token layer; see setLateMutationFilter. Null means
    *  retain nothing. */
@@ -2601,12 +2644,14 @@ export class UiBridge {
    *  retry_of. Leaving `pending` is not settlement — a reply timeout, a
    *  mid-command drop and a workflow replacement all leave it with the outcome
    *  unknown — so a run barrier reads settlement only from here. */
-  private settledMutations = new Map<string, { tabId: string; ts: number }>();
+  private settledMutations = new Map<string, SettledMutation>();
   /** #2955 — what bounded memory could not keep: unknown-outcome receipts evicted
-   *  by TTL or capacity, compacted per canonical tab (plus one global overflow
-   *  marker). A marker is cleared only by a definite outcome for a tracked rid
-   *  (late reply, exact terminal retry_of) or by retiring the tab's browser
-   *  incarnation (fireTabGone) — never by elapsed time. See evictUnsettledReceipt. */
+   *  by TTL or capacity, compacted per (canonical tab, receiving browser document)
+   *  plus one global overflow marker. A marker is cleared only by the late reply of
+   *  a tracked rid — never by elapsed time, and never by a disconnect outlasting
+   *  its grace (the document may still be alive and finish the edit). A run on a
+   *  DIFFERENT proven document under the same key is not affected by it; see
+   *  panel-tools incarnationRelevant. */
   private uncertainty = new Map<string, EvictedUncertainty>();
   private static readonly MAX_UNCERTAIN_TARGETS = 64;
   private static readonly MAX_UNCERTAIN_RIDS = 32;
@@ -3710,6 +3755,11 @@ export class UiBridge {
           if (fifo) {
             this.askRidToId.delete(rid);
             this.settlePendingReply(fifo.rid, fifo.pending, msg, sock);
+            // #2955 — the reply still names ITS OWN rid: if that is a delivered
+            // receipt whose outcome was unknown (a timed-out original whose retry is
+            // the waiter just unblocked), this is that original's definite late
+            // outcome too. Record it; the FIFO hand-off above is unchanged.
+            this.recordLateMutation(rid, msg);
             return;
           }
           this.recordLateMutation(rid, msg);
@@ -5049,12 +5099,14 @@ export class UiBridge {
         ts: e.ts,
         frame: e.frame,
         status: e.status,
+        ...(e.incarnation ? { incarnation: e.incarnation } : {}),
         settlement: p !== undefined && e.status === "in_flight" ? "awaiting" : "unknown",
       });
     }
     for (const [rid, p] of this.pending) {
       if (this.deliveredMutations.has(rid) || !this.isTrackedMutation(p.cmd)) continue;
       if (!matches(p.ctx.tabId, p)) continue;
+      const incarnation = p.sock ? this.sockIncarnation.get(p.sock)?.incarnation : undefined;
       out.push({
         rid,
         cmd: p.cmd,
@@ -5062,6 +5114,7 @@ export class UiBridge {
         ts: p.ctx.deadline - p.ctx.timeoutMs,
         frame: cloneDeliveredMutationFrame(p.ctx.command),
         status: "in_flight",
+        ...(incarnation ? { incarnation } : {}),
         settlement: "awaiting",
       });
     }
@@ -5084,15 +5137,17 @@ export class UiBridge {
     this.pruneLateMutations();
     const { canonical } = this.routeForReceipts(tabId);
     const out: UncertainTarget[] = [];
-    for (const key of new Set([canonical, tabId, ALL_TABS_UNCERTAINTY])) {
-      const marker = this.uncertainty.get(key);
-      if (!marker) continue;
+    for (const marker of this.uncertainty.values()) {
+      if (marker.tab !== canonical && marker.tab !== tabId && marker.tab !== ALL_TABS_UNCERTAINTY) {
+        continue;
+      }
       out.push({
-        tabId: key,
+        tabId: marker.tab,
+        ...(marker.incarnation ? { incarnation: marker.incarnation } : {}),
         count: marker.count,
         workflowUuids: [...marker.workflowUuids],
         unstamped: marker.unstamped,
-        rids: [...marker.rids.keys()],
+        rids: [...marker.rids],
         cmds: [...marker.cmds],
         since: marker.since,
       });
@@ -5139,31 +5194,47 @@ export class UiBridge {
   }
 
   /**
-   * #2955 — an exact retry_of of this outcome-unknown mutation was answered with
-   * a TERMINAL result (the caller checks that; see panel-tools
-   * isTerminalReconcileReply). The panel's rid ledger answers a retained
-   * original's retry with the original's own outcome — awaiting it if still
-   * running — and executes the same fingerprint fresh only when it holds no
-   * record of the original. Either way the requested command is now in effect
-   * and no original is still running behind it in that ledger. `retried` must be
-   * the command the retry carried: it has to be the same command as the
-   * receipt (or as the identity hash an evicted marker kept for it).
+   * #2955 — settle outcome-unknown receipt `rid` from its retry `retryRid`, ONLY
+   * when the retry provably re-issued the same command to the same receiver:
+   *  - `rid` is still a full receipt here (an evicted marker kept no frame, so
+   *    nothing can prove identity for it — it stays uncertain until its own late
+   *    reply or tab retirement);
+   *  - the retry's own receipt was answered ok under its OWN rid (a terminal
+   *    reply is checked by the caller; a #2559 FIFO-matched ack does not count);
+   *  - both were written to the same canonical tab and the same connection
+   *    incarnation — a different tab's or page's ledger never saw the original
+   *    and would have failed open;
+   *  - their exact frames are identical: every argument plus the trusted
+   *    workflow stamp (exactFrameKey), so another workflow, another position,
+   *    another graph payload or connection is a different command.
+   * The panel's ledger then answered that retry with the original's own outcome
+   * (awaiting it if still running) or, holding no record of it, ran the identical
+   * command on the identical receiver — in either case the requested command is
+   * in effect there and nothing of the original is still running behind it.
+   * Anything not provable returns false and leaves the outcome unknown.
    */
-  markMutationReconciled(rid: string, retried: Record<string, unknown>): boolean {
+  markMutationReconciled(rid: string, retryRid: string): boolean {
     const e = this.deliveredMutations.get(rid);
-    if (e) {
-      if (this.mutationSettlement(rid) !== "unknown") return false;
-      if (mutationIdentityHash(e.frame) !== mutationIdentityHash(retried)) return false;
-      this.deliveredMutations.delete(rid);
-      this.recordMutationSettled(rid, e.tabId);
-      this.notifyMutationSettled(e.tabId);
-      return true;
-    }
-    return this.resolveEvictedRid(rid, mutationIdentityHash(retried));
+    if (!e || this.mutationSettlement(rid) !== "unknown") return false;
+    const retry = this.settledMutations.get(retryRid)?.answeredOk;
+    if (!retry || retryRid === rid) return false;
+    const retryTab = this.settledMutations.get(retryRid)?.tabId;
+    if (retryTab !== e.tabId) return false;
+    if (!e.incarnation || retry.incarnation !== e.incarnation) return false;
+    const originalKey = exactFrameKey(e.frame);
+    if (originalKey === undefined || retry.key !== originalKey) return false;
+    this.deliveredMutations.delete(rid);
+    this.recordMutationSettled(rid, e.tabId);
+    this.notifyMutationSettled(e.tabId);
+    return true;
   }
 
-  private recordMutationSettled(rid: string, tabId: string): void {
-    this.settledMutations.set(rid, { tabId, ts: Date.now() });
+  private recordMutationSettled(
+    rid: string,
+    tabId: string,
+    answeredOk?: SettledMutation["answeredOk"],
+  ): void {
+    this.settledMutations.set(rid, { tabId, ts: Date.now(), ...(answeredOk ? { answeredOk } : {}) });
     this.pruneLateMutations();
     this.notifyMutationReplyWaiters();
   }
@@ -5186,34 +5257,42 @@ export class UiBridge {
   /**
    * #2955 — forget one delivered receipt whose reply is not awaited. A receipt
    * whose outcome is unknown leaves a compact, target-bound marker: its tab,
-   * the workflow stamp it carried, and (while there is room) its rid and
-   * identity hash. Memory stays bounded — MAX_UNCERTAIN_TARGETS markers, each
+   * the workflow stamp it carried, the receiving browser document, and (while
+   * there is room) its rid. Memory stays bounded — MAX_UNCERTAIN_TARGETS markers, each
    * tracking at most MAX_UNCERTAIN_RIDS rids — and overflow folds into the
    * all-tabs marker, so uncertainty is compacted but never silently dropped.
    */
   private evictUnsettledReceipt(
     rid: string,
-    e: { cmd: string; tabId: string; frame: Record<string, unknown> },
+    e: { cmd: string; tabId: string; frame: Record<string, unknown>; incarnation?: string },
   ): void {
     this.deliveredMutations.delete(rid);
     if (e.cmd === "graph_run") return;
-    let key = e.tabId;
+    let key = JSON.stringify([e.tabId, e.incarnation ?? null]);
+    let tab = e.tabId;
+    let incarnation = e.incarnation;
     if (!this.uncertainty.has(key) && this.uncertainty.size >= UiBridge.MAX_UNCERTAIN_TARGETS) {
-      // Fold the OLDEST per-tab marker into the all-tabs one to make room.
+      // Fold the OLDEST per-target marker into the all-tabs one to make room.
       for (const [oldKey, old] of this.uncertainty) {
         if (oldKey === ALL_TABS_UNCERTAINTY) continue;
         this.uncertainty.delete(oldKey);
-        this.mergeUncertainty(ALL_TABS_UNCERTAINTY, old);
+        this.mergeUncertainty(ALL_TABS_UNCERTAINTY, { ...old, tab: ALL_TABS_UNCERTAINTY, incarnation: undefined });
         break;
       }
-      if (this.uncertainty.size >= UiBridge.MAX_UNCERTAIN_TARGETS) key = ALL_TABS_UNCERTAINTY;
+      if (this.uncertainty.size >= UiBridge.MAX_UNCERTAIN_TARGETS) {
+        key = ALL_TABS_UNCERTAINTY;
+        tab = ALL_TABS_UNCERTAINTY;
+        incarnation = undefined;
+      }
     }
     const stamp = typeof e.frame.workflow_uuid === "string" ? e.frame.workflow_uuid : undefined;
     this.mergeUncertainty(key, {
+      tab,
+      ...(incarnation ? { incarnation } : {}),
       workflowUuids: new Set(stamp ? [stamp] : []),
       unstamped: stamp === undefined,
       count: 1,
-      rids: new Map([[rid, mutationIdentityHash(e.frame)]]),
+      rids: new Set([rid]),
       cmds: new Set([e.cmd]),
       since: Date.now(),
     });
@@ -5224,10 +5303,12 @@ export class UiBridge {
 
   private mergeUncertainty(key: string, add: EvictedUncertainty): void {
     const into = this.uncertainty.get(key) ?? {
+      tab: add.tab,
+      ...(add.incarnation ? { incarnation: add.incarnation } : {}),
       workflowUuids: new Set<string>(),
       unstamped: false,
       count: 0,
-      rids: new Map<string, string>(),
+      rids: new Set<string>(),
       cmds: new Set<string>(),
       since: add.since,
     };
@@ -5237,8 +5318,8 @@ export class UiBridge {
     }
     into.unstamped ||= add.unstamped;
     into.count += add.count;
-    for (const [rid, hash] of add.rids) {
-      if (into.rids.size < UiBridge.MAX_UNCERTAIN_RIDS) into.rids.set(rid, hash);
+    for (const rid of add.rids) {
+      if (into.rids.size < UiBridge.MAX_UNCERTAIN_RIDS) into.rids.add(rid);
     }
     for (const cmd of add.cmds) {
       if (into.cmds.size < UiBridge.MAX_UNCERTAIN_CMDS) into.cmds.add(cmd);
@@ -5247,12 +5328,10 @@ export class UiBridge {
     this.uncertainty.set(key, into);
   }
 
-  /** A definite outcome for an evicted rid: drop it from its marker. */
-  private resolveEvictedRid(rid: string, identityHash?: string): boolean {
+  /** The evicted rid's OWN late reply (its definite outcome): drop it from its marker. */
+  private resolveEvictedRid(rid: string): boolean {
     for (const [key, marker] of this.uncertainty) {
-      const hash = marker.rids.get(rid);
-      if (hash === undefined) continue;
-      if (identityHash !== undefined && hash !== identityHash) return false;
+      if (!marker.rids.has(rid)) continue;
       marker.rids.delete(rid);
       marker.count -= 1;
       if (marker.count <= 0) this.uncertainty.delete(key);
@@ -5262,21 +5341,6 @@ export class UiBridge {
     return false;
   }
 
-  /**
-   * #2955 — identity retirement. The browser-tab incarnation that held this
-   * tab's canvas did not return within its grace (fireTabGone): no command it
-   * was still running can apply any more, so its unknown outcomes stop
-   * describing any live canvas. Awaited requests are untouched.
-   */
-  private retireTabUncertainty(tabId: string): void {
-    this.uncertainty.delete(tabId);
-    for (const [rid, e] of this.deliveredMutations) {
-      if (e.tabId !== tabId || this.pending.has(rid)) continue;
-      this.deliveredMutations.delete(rid);
-    }
-    this.notifyMutationSettled(tabId);
-    this.notifyMutationReplyWaiters();
-  }
 
   private notifyMutationReplyWaiters(): void {
     for (const check of [...this.mutationReplyWaiters]) check();
@@ -5632,9 +5696,6 @@ export class UiBridge {
     // Re-check on the INCARNATION, not the key: something else may now hold this
     // recurring id, and a stranger holding the key is not this tab coming back.
     if (this.conns.get(tabId)?.incarnationId === incarnation) return;
-    // #2955 — retire only when NOTHING holds the key: if a different browser tab
-    // has taken it over, receipts under this id may be its own, so they stay.
-    if (!this.conns.has(tabId)) this.retireTabUncertainty(tabId);
     try {
       this.onTabGone?.(tabId, incarnation);
     } catch (err) {
@@ -5793,7 +5854,7 @@ export class UiBridge {
     clearTimeout(pending.timer);
     this.pending.delete(rid);
     this.askRidToId.delete(rid);
-    this.forgetDeliveredMutation(rid);
+    this.forgetDeliveredMutation(rid, msg.ok === true && msg.rid === rid);
     if (msg.ok) {
       // #422 — the panel DEMONSTRABLY served this command. Record it on the LIVE
       // connection (following a same-socket tmp:→wf: migration whose reply landed
@@ -7263,7 +7324,7 @@ export class UiBridge {
       if (ctx.workflowUuid) frame.workflow_uuid = ctx.workflowUuid;
       else delete frame.workflow_uuid;
       conn.sock.send(JSON.stringify(frame));
-      this.rememberDeliveredMutation(rid, cmd.cmd, ctx.tabId, frame);
+      this.rememberDeliveredMutation(rid, cmd.cmd, ctx.tabId, frame, conn.incarnationId);
       try { ctx.onDispatchedRid?.(rid); } catch { /* observer faults are non-fatal */ }
     } catch (err) {
       clearTimeout(timer);
@@ -7297,6 +7358,7 @@ export class UiBridge {
     cmd: string,
     tabId: string,
     frame: Record<string, unknown>,
+    incarnation?: string,
   ): void {
     if (!rid || !this.lateMutationFilter?.(cmd)) return;
     this.pruneLateMutations();
@@ -7306,16 +7368,22 @@ export class UiBridge {
       ts: Date.now(),
       frame: cloneDeliveredMutationFrame(frame),
       status: "in_flight",
+      ...(incarnation ? { incarnation } : {}),
     });
   }
 
-  private forgetDeliveredMutation(rid: string): void {
+  /** `answeredOk`: the panel replied ok under THIS rid (not a #2559 FIFO match). */
+  private forgetDeliveredMutation(rid: string, answeredOk = false): void {
     const hit = this.deliveredMutations.get(rid);
     if (!hit) return;
     this.deliveredMutations.delete(rid);
     // #2955 — both callers are definite outcomes: the panel answered this rid
     // (settlePendingReply), or the frame was never written (send failure).
-    this.recordMutationSettled(rid, hit.tabId);
+    this.recordMutationSettled(
+      rid,
+      hit.tabId,
+      answeredOk ? { incarnation: hit.incarnation, key: exactFrameKey(hit.frame) } : undefined,
+    );
     if (hit.status === "timed_out") this.notifyMutationSettled(hit.tabId);
   }
 

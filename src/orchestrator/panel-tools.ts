@@ -1642,7 +1642,9 @@ function isTerminalReconcileReply(cmd: Record<string, unknown>, res: ToolResult)
     body.deferred === true ||
     body.status === "waiting_for_queue_idle" ||
     body.queued_unknown === true ||
-    body.applied === false
+    // Any explicit `applied` other than true — false, "unknown", … — is not an
+    // applied outcome, whatever else the reply carries (a `set` included).
+    (Object.prototype.hasOwnProperty.call(body, "applied") && body.applied !== true)
   ) {
     return false;
   }
@@ -20784,9 +20786,12 @@ function withRetryToken(d: PanelToolDef): PanelToolDef {
       // workflow". Answer from the receipt instead. A sibling mutation inside
       // the same handler (enter_subgraph during a set_widget retry) must not
       // carry this token at all.
-      // #2955 — the retry's own dispatch of the original's exact command, kept so
-      // its outcome can settle that receipt AFTER the handler has judged it.
-      const reconcile: { last: { cmd: Record<string, unknown>; res: ToolResult } | null } = { last: null };
+      // #2955 — the retry's own dispatch of the original's exact frame, and the rid
+      // it went out under, kept so the bridge can PROVE (same receiver, same exact
+      // command) that it settles the original — after the handler has judged it.
+      const reconcile: {
+        last: { cmd: Record<string, unknown>; res: ToolResult; retryRid?: string } | null;
+      } = { last: null };
       const wrapped = Object.create(ctx) as PanelToolCtx;
       wrapped.call = (
         cmd: Record<string, unknown>,
@@ -20809,22 +20814,20 @@ function withRetryToken(d: PanelToolDef): PanelToolDef {
           if (mutationIdentityMatches(cmd, original.frame)) {
             const replay: Record<string, unknown> = { ...original.frame, retry_of: retryOf };
             delete replay.rid;
-            return ctx.call(replay, timeoutMs, onDispatchedRid, beforeDispatch).then((res) => {
-              if (original.status !== "settled") reconcile.last = { cmd: replay, res };
+            let retryRid: string | undefined;
+            const observeRetryRid = (dispatched: string): void => {
+              retryRid = dispatched;
+              onDispatchedRid?.(dispatched);
+            };
+            return ctx.call(replay, timeoutMs, observeRetryRid, beforeDispatch).then((res) => {
+              if (original.status !== "settled") reconcile.last = { cmd: replay, res, retryRid };
               return res;
             });
           }
         }
-        const sent = RETRY_TOKEN_CMDS.has(cmdName) ? { ...cmd, retry_of: retryOf } : cmd;
-        // #2955 — no receipt left for this token: the bridge may still hold an
-        // evicted-uncertainty marker for it, which only an identical command can
-        // resolve (markMutationReconciled checks the kept identity hash).
-        if (!original && RETRY_TOKEN_CMDS.has(cmdName)) {
-          return ctx.call(sent, timeoutMs, onDispatchedRid, beforeDispatch).then((res) => {
-            reconcile.last = { cmd: sent, res };
-            return res;
-          });
-        }
+        // #2955 — no full receipt for this token (never seen, or evicted to an
+        // uncertainty marker): nothing here can prove the retry is the original's
+        // exact command on its receiver, so this path never settles anything.
         return ctx.call(
           // Ask the RETRY MAP's question, not the workflow fence's (codex gate).
           // These were the same answer only while isMutatingGraphCommand
@@ -20853,8 +20856,12 @@ function withRetryToken(d: PanelToolDef): PanelToolDef {
       // uncertain queue reply — and a handler that accepted it settle the
       // outcome-unknown receipt a run barrier is holding on.
       const candidate = reconcile.last;
-      if (candidate && !out.isError && isTerminalReconcileReply(candidate.cmd, candidate.res)) {
-        ctx.bridge?.markMutationReconciled?.(retryOf, candidate.cmd);
+      if (
+        candidate?.retryRid &&
+        !out.isError &&
+        isTerminalReconcileReply(candidate.cmd, candidate.res)
+      ) {
+        ctx.bridge?.markMutationReconciled?.(retryOf, candidate.retryRid);
       }
       // Drained AFTER the handler, deliberately, for two measured reasons.
       //
@@ -21063,18 +21070,36 @@ function runTargetDrift(before: RunTargetWitness, after: RunTargetWitness): stri
   return null;
 }
 
-/** An evicted-uncertainty marker binds like an unsettled edit: by workflow stamp. */
+/**
+ * #2955 — does an edit received by browser document `received` bear on a run
+ * whose receiving document is the witness's? Only a PROVEN different document
+ * (two distinct `tab_session_id`s: two in-memory graphs) is unaffected. An
+ * unknown or anonymous identity on either side cannot be told apart from the
+ * run's document — anonymous ids are minted per connection, so a surviving
+ * document that reconnects gets a new one — and stays relevant.
+ */
+function incarnationRelevant(received: string | undefined, w: RunTargetWitness): boolean {
+  const target = w.connection?.tabSessionId;
+  if (!received || !target || received.startsWith("anon:") || target.startsWith("anon:")) return true;
+  return received === target;
+}
+
+/** An evicted-uncertainty marker binds like an unsettled edit: by document and workflow stamp. */
 function uncertaintyRelevantToRun(t: UncertainTarget, w: RunTargetWitness): boolean {
+  if (!incarnationRelevant(t.incarnation, w)) return false;
   if (t.unstamped || w.workflow.known !== true || w.workflow.uuid === undefined) return true;
   return t.workflowUuids.includes(w.workflow.uuid);
 }
 
 /**
- * An unsettled edit stamped for a DIFFERENT workflow than the one the run
- * would be stamped with cannot apply to this graph — the panel's write-time
- * stamp fence refuses it. Anything unstamped or unverifiable stays relevant.
+ * An unsettled edit received by a DIFFERENT proven browser document, or stamped
+ * for a DIFFERENT workflow than the one the run would be stamped with, cannot
+ * apply to this graph — another document is another in-memory graph, and the
+ * panel's write-time stamp fence refuses a mismatched workflow. Anything
+ * unstamped, anonymous or unverifiable stays relevant.
  */
 function editRelevantToRun(m: UnsettledMutation, w: RunTargetWitness): boolean {
+  if (!incarnationRelevant(m.incarnation, w)) return false;
   const stamped = typeof m.frame.workflow_uuid === "string" ? m.frame.workflow_uuid : undefined;
   if (stamped === undefined || w.workflow.known !== true || w.workflow.uuid === undefined) return true;
   return stamped === w.workflow.uuid;
@@ -21252,13 +21277,16 @@ function withRunFreshnessBarrier(d: PanelToolDef): PanelToolDef {
             `receipt memory while their outcome was still UNKNOWN (${cmds.join(", ") || "unrecorded commands"}). ` +
             `Forgotten history is not freshness: they may have applied or may still apply. ` +
             (tracked.length
-              ? `Settle each by re-issuing that exact edit with its own token (${tracked
-                  .map((rid) => `retry_of:"${rid}"`)
-                  .join(", ")}) or by its late acknowledgement. `
+              ? `Their command details were not kept, so a retry cannot prove it re-issued the ` +
+                `same command on the same canvas and does NOT clear them; each tracked one ` +
+                `(${tracked.map((rid) => `retry_of:"${rid}"`).join(", ")}) clears only on its own ` +
+                `late acknowledgement. `
               : "") +
             (total > tracked.length
-              ? `${total - tracked.length} of them were not individually tracked and clear only when ` +
-                `the browser tab that received them is gone (closed, and not back within its grace). `
+              ? `${total - tracked.length} of them were not individually tracked and cannot be ` +
+                `cleared in this orchestrator process: a disconnect proves nothing about the browser ` +
+                `document that received them. Runs on a DIFFERENT browser tab's canvas are not ` +
+                `affected by them. `
               : ""),
         );
       }
