@@ -24,6 +24,9 @@ class FakeChild extends EventEmitter {
 const mockConfig = vi.hoisted(() => ({
   resolvedPort: 8188,
   comfyuiPath: undefined as string | undefined,
+  /** Mutable so a test can retarget mid-restart, as a second agent would. */
+  baseUrl: "http://127.0.0.1:8188",
+  remoteMode: false,
 }));
 const mockExecSync = vi.hoisted(() => vi.fn());
 const mockSpawn = vi.hoisted(() => vi.fn());
@@ -37,12 +40,12 @@ vi.mock("node:os", () => ({ platform: () => "linux" }));
 
 vi.mock("../../config.js", () => ({
   config: mockConfig,
-  getComfyUIBaseUrl: () => "http://127.0.0.1:8188",
+  getComfyUIBaseUrl: () => mockConfig.baseUrl,
   getComfyUIAuthHeaders: () => ({}),
   // #848 instance fence — a stable target here; the retarget cases live in
   // desktop-restart.test.ts and panel-restart-health-readiness.test.ts.
   getComfyuiTargetGeneration: () => 0,
-  isRemoteMode: () => false,
+  isRemoteMode: () => mockConfig.remoteMode,
 }));
 
 vi.mock("node:child_process", () => ({
@@ -168,6 +171,8 @@ beforeEach(() => {
   process.env.COMFYUI_PORT_FREE_TIMEOUT_S = "1";
   mockConfig.resolvedPort = 8188;
   mockConfig.comfyuiPath = BASE;
+  mockConfig.baseUrl = "http://127.0.0.1:8188";
+  mockConfig.remoteMode = false;
   mockFindComfyuiPython.mockReturnValue(PYTHON);
   mockExistsSync.mockImplementation((p: string) => {
     const s = String(p);
@@ -705,4 +710,133 @@ describe("restart_comfyui on POSIX — port release via lsof (#776)", () => {
 
     killSpy.mockRestore();
   }, 30_000);
+});
+
+// Moved from restart-target-anchor.test.ts (#2947). That file is pinned to win32,
+// where a local kill+relaunch now refuses before the stop; the post-stop window
+// these cover exists only off Windows, so they run here on the POSIX branch.
+describe("a local restart never abandons the instance it stopped", () => {
+  /** A live local server on 8188 that goes quiet once killed. */
+  const liveThenFree = (pid = 4321): { killed: () => boolean } => {
+    let killed = false;
+    mockExecSync.mockImplementation((cmd: string) => {
+      if (/kill/i.test(cmd)) {
+        killed = true;
+        return "";
+      }
+      if (/lsof/i.test(cmd)) {
+        if (killed) throw lsofNoMatches();
+        return `p${pid}\nn127.0.0.1:8188\n`;
+      }
+      return "";
+    });
+    return { killed: () => killed };
+  };
+
+  it("reports the stop honestly instead of throwing when another agent retargets to REMOTE mid-stop", async () => {
+    // The P0 in full: the stop commits, then the relaunch used to hit the
+    // remote-mode refusal and throw — unwinding past every report and leaving
+    // the caller with an exception where the fact "your server is down" should
+    // have been. This drives `restartComfyUI`, not the unit below it, so it
+    // fails if the refusal is reinstated OR if the post-stop catch is removed
+    // and something else throws past the same point.
+    const port = liveThenFree();
+    // The retarget lands during the post-stop window, exactly as a second agent
+    // on this rig would do it.
+    mockSpawn.mockImplementation(() => {
+      mockConfig.remoteMode = true;
+      mockConfig.baseUrl = "http://beta.example:8188";
+      throw new Error("relaunch could not be spawned");
+    });
+    // Nothing is listening after the failed relaunch — the ordinary case.
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () => {
+        throw new Error("ECONNREFUSED");
+      }),
+    );
+    const killSpy = vi.spyOn(process, "kill").mockImplementation(() => true);
+
+    // The whole assertion is that this RESOLVES. A rejection here is the bug.
+    const res = await restartComfyUI();
+
+    expect(port.killed()).toBe(true); // the stop really did happen
+    expect(res.stopped).toBe(true); // ...and the report says so
+    expect(res.started).toBe(false);
+    // The relaunch WAS attempted and threw partway, so what we cannot say is
+    // whether it took effect. "not-attempted" would be a different claim, and a
+    // false one.
+    expect(res.startup).toBe("unconfirmed");
+    expect(res.message).toMatch(/relaunch failed partway/i);
+    // NOT a bare "ComfyUI is NOT running": nothing answered when asked, which is
+    // one observation, and this branch exists to stop exactly that becoming a
+    // verdict. The wording must keep the two apart.
+    expect(res.message).toMatch(/most likely down/i);
+    expect(res.message).toMatch(/not a settled fact/i);
+    // The one thing it must never say is the remote-mode refusal, which would be
+    // a bucket narrated as the cause of a dead local server.
+    expect(res.message).not.toMatch(/targeting a remote/i);
+
+    killSpy.mockRestore();
+  }, 20_000);
+
+  it("does NOT say nothing answered when the endpoint returns 503 — not healthy is not not-there", async () => {
+    // `waitForApiReady` counts a 502/503/504 as not-ready, which is right for
+    // readiness and wrong as evidence of absence. Reading `ready:false` as
+    // "nothing is listening" is the same fold one level down: a proxy answering
+    // 503 in front of a starting server would be reported as a dead machine.
+    liveThenFree();
+    mockSpawn.mockImplementation(() => {
+      throw new Error("relaunch could not be spawned");
+    });
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () => new Response("service unavailable", { status: 503 })),
+    );
+    const killSpy = vi.spyOn(process, "kill").mockImplementation(() => true);
+
+    const res = await restartComfyUI();
+
+    expect(res.startup).toBe("unconfirmed");
+    expect(res.message).not.toMatch(/nothing answered/i);
+    // It may still say "most likely down" — that is a hedge, not a claim — but it
+    // must carry the caveat that something could be listening.
+    expect(res.message).toMatch(/not "?not there"?|may well be listening/i);
+
+    killSpy.mockRestore();
+  }, 20_000);
+
+  it("does NOT report down when something IS answering after a failed relaunch", async () => {
+    // The other half of the same finding: a supervisor may have brought the
+    // instance back while we were unwinding, or the throw may have landed after
+    // a spawn. Reporting "down" over a live server is the unverified negative in
+    // its most misleading form — the user goes looking for a dead process.
+    liveThenFree();
+    mockSpawn.mockImplementation(() => {
+      throw new Error("relaunch could not be spawned");
+    });
+    // The post-failure probe finds a live server.
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(
+        async () =>
+          new Response(JSON.stringify({ system: {} }), {
+            status: 200,
+            headers: { "content-type": "application/json" },
+          }),
+      ),
+    );
+    const killSpy = vi.spyOn(process, "kill").mockImplementation(() => true);
+
+    const res = await restartComfyUI();
+
+    expect(res.startup).toBe("unconfirmed");
+    expect(res.message).toMatch(/IS answering/i);
+    expect(res.message).not.toMatch(/most likely down/i);
+    // And it must not claim that server either — this call did not start it.
+    expect(res.started).toBe(false);
+    expect(res.message).toMatch(/cannot claim that server as its own/i);
+
+    killSpy.mockRestore();
+  }, 20_000);
 });

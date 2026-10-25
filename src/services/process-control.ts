@@ -275,7 +275,8 @@ interface StopResult {
   /**
    * The Desktop launcher to spawn on `action:"start"`, when one was observed
    * (parent process or a known Desktop-2 install path). Distinct from
-   * `restart_hint`, which is the recovery instruction for a human.
+   * `restart_hint`, which is the recovery instruction for a human. On Windows it
+   * is informational only: `action:"start"` refuses to spawn it (#2947).
    */
   launch?: { exe: string };
   /** Present whenever a hand-restart may be needed — always on a refusal. */
@@ -524,6 +525,25 @@ let supervisorGaveUp = false;
 // ---------------------------------------------------------------------------
 
 const IS_WIN = platform() === "win32";
+
+/**
+ * #2947 — on Windows this process does not launch ComfyUI itself. A process it
+ * spawns is a descendant of the agent's process tree, and agent teardown (Codex
+ * AppServerClient.close → `taskkill /T /F`, an orchestrator self-update) kills
+ * that tree. `detached` + `unref()` do not take a child out of it. No launcher
+ * that escapes the tree has been proven, so every direct spawn — Desktop exe,
+ * Python relaunch, #1847 self-relaunch, crash-supervisor respawn — is refused,
+ * and every restart that would depend on one refuses BEFORE stopping anything.
+ * Supervisor-owned restarts (a verified Desktop shell or Manager re-exec) are not
+ * direct spawns and are unaffected. COMFYUI_RESTART_COMMAND is unchanged too, but
+ * it is the user's command, not a launcher proven here: if it starts ComfyUI as
+ * its own child, that child is in the same tree, and nothing here claims otherwise.
+ */
+const WINDOWS_DIRECT_LAUNCH_REFUSAL =
+  "On Windows, comfyui-mcp does not launch ComfyUI itself: a process started from here " +
+  "belongs to the agent's process tree, and closing or updating the agent can terminate " +
+  "that whole tree (taskkill /T) — detaching the child does not protect it. Start ComfyUI " +
+  "from the ComfyUI Desktop app, its own launcher, or a console you control.";
 
 // parseListenerPidFromNetstat / findPidByPort now live in port-owner.ts so the
 // live-interpreter resolver can use them without importing this module (which would
@@ -2098,17 +2118,20 @@ function supervisorResult(info?: ProcessInfo): SupervisorResult {
   const policy = getRestartPolicy();
   return {
     enabled: policy.enabled,
-    supported: Boolean(info && !info.isDesktopApp),
+    // A crash respawn is a direct spawn, so it is never supported on Windows (#2947).
+    supported: Boolean(info && !info.isDesktopApp && !IS_WIN),
     max_restarts: policy.maxRestarts,
     window_ms: policy.windowMs,
     restart_count: supervisorRestartCount,
     gave_up: supervisorGaveUp,
     message: !policy.enabled
       ? "Auto-restart is disabled."
-      : info?.isDesktopApp
-        ? "Auto-restart supervision is only supported for directly spawned Python ComfyUI processes." +
-          desktopEvidenceNote(info.desktopEvidence)
-        : undefined,
+      : IS_WIN
+        ? `Auto-restart supervision is not available. ${WINDOWS_DIRECT_LAUNCH_REFUSAL}`
+        : info?.isDesktopApp
+          ? "Auto-restart supervision is only supported for directly spawned Python ComfyUI processes." +
+            desktopEvidenceNote(info.desktopEvidence)
+          : undefined,
   };
 }
 
@@ -2163,15 +2186,16 @@ function adoptLaunchedChild(child: ChildProcess): void {
 }
 
 function spawnFromProcessInfo(info: ProcessInfo): SpawnedComfyUI | null {
+  // #2947: the backstop for every spawn site. Callers that report to a user
+  // refuse earlier with WINDOWS_DIRECT_LAUNCH_REFUSAL; the crash supervisor and
+  // the Manager handoff replay reach this directly.
+  if (IS_WIN) {
+    logger.warn(WINDOWS_DIRECT_LAUNCH_REFUSAL);
+    return null;
+  }
   // #1847: a proven python command is the relaunch, not the Desktop exe.
   // Spawning the exe is the #400 failure (listener never comes back).
   if (info.isDesktopApp && !info.selfRelaunch) {
-    if (IS_WIN) {
-      const exe = info.desktopExePath;
-      if (!exe) return null;
-      return { child: spawn(exe, [], { detached: true, stdio: "ignore", shell: false }) };
-    }
-
     const appPath = info.desktopExePath ?? "ComfyUI";
     return { child: spawn("open", ["-a", appPath], { detached: true, stdio: "ignore" }) };
   }
@@ -3550,6 +3574,18 @@ function assessDesktopSupervision(info: ProcessInfo): {
   // Any missing file keeps the refusal.
   if (parentIdentityUnreadableAt === info.pid) {
     const proven = proveDesktopSelfRelaunch(info);
+    // #2947: that spawn is a direct launch, refused on Windows — and the Manager
+    // stop would already have happened by then, so refuse it here, before it.
+    if (proven.ok && IS_WIN) {
+      return {
+        ...cannotAssess(
+          `${because ?? `PID ${info.pid}'s parent exists but what it is running could not be read`}` +
+            `; the only fallback is relaunching it from this process after the stop, which is ` +
+            `refused here: ${WINDOWS_DIRECT_LAUNCH_REFUSAL}`,
+        ),
+        supervision: verdict,
+      };
+    }
     if (proven.ok) {
       return {
         ok: true,
@@ -4450,12 +4486,18 @@ export async function stopComfyUI(preInfo?: ProcessInfo): Promise<StopResult> {
   // collapsed into "there is no restart information", which would say something
   // untrue about a case where the command is right there.
   const relaunch = assessRelaunch(info);
+  // #2947/#2948: on Windows a validated command is still not something
+  // restart_comfyui (action:"start") will run. The stop stays allowed — it is an
+  // explicit instruction, and the refusal rule below is unchanged — but every
+  // field that claims a way back must say there is none from here.
+  const startable = relaunch.ok && !IS_WIN;
+  const startBlocked = IS_WIN ? WINDOWS_DIRECT_LAUNCH_REFUSAL : relaunch.reason;
   // Resolved EXPLICITLY rather than read off `info.envPlan`, which is only populated
   // by whichever caller happened to ask for it — a caveat that appears when the stop
   // came through restartComfyUI and vanishes when the same install is stopped
   // directly would be worse than no caveat at all.
   let envPlan: LaunchEnvResolution | undefined;
-  if (relaunch.ok && !info.isDesktopApp) {
+  if (startable && !info.isDesktopApp) {
     const cmd = resolveLaunchCommand(info);
     if (cmd) envPlan = ensureLaunchEnvPlan(info, cmd);
   }
@@ -4618,20 +4660,21 @@ export async function stopComfyUI(preInfo?: ProcessInfo): Promise<StopResult> {
       (unverified ? ` — NOTE: ${unverified}; continuing so the server can be brought back.` : "") +
       // Said PLAINLY and up front, not left to a boolean the caller may not read:
       // restart_comfyui (action:"start") will not be able to do this, so the human has to.
-      (relaunch.ok
+      (startable
         ? // A command exists, but the environment it was launched into may not be
           // reproducible — a weaker claim, stated as one.
           envPlan && !envPlan.reproducible
           ? ` NOTE: ${envPlan.reason ?? envPlan.info.note} restart_comfyui (action:"start") will still try, but the relaunch may fail during import.` +
             describeRecovery(hint)
           : ""
-        : ` WARNING: restart_comfyui (action:"start") will NOT be able to bring this back — ${relaunch.reason}` +
+        : ` WARNING: restart_comfyui (action:"start") will NOT be able to bring this back — ${startBlocked}` +
           describeRecovery(hint)),
     // The one claim #767 was about: it now means a relaunch command was built AND
-    // validated, not merely that some process info was stored.
-    has_restart_info: relaunch.ok,
+    // validated, not merely that some process info was stored — and (#2947) that
+    // action:"start" is allowed to run it.
+    has_restart_info: startable,
     launch: info.desktopExePath ? { exe: info.desktopExePath } : undefined,
-    relaunch_blocked: relaunch.ok ? undefined : relaunch.reason,
+    relaunch_blocked: startable ? undefined : startBlocked,
     restart_hint: hint,
     auto_restart: supervisorResult(info),
     unverified_exit: unverified,
@@ -4715,6 +4758,19 @@ export async function startComfyUI(anchor?: {
       pid: preLaunchProbe.pid,
       // Something is serving the port and we never got as far as spawning. We did
       // not classify a launch of ours, so we may not name a definite verdict.
+      listener_ownership: unclassifiedOwnership(),
+    };
+  }
+  // #2947: nothing below may spawn on Windows. Checked after "already running",
+  // which stays a truthful no-op, and before any launch record is built.
+  if (IS_WIN) {
+    const hint = savedInfo ? recoveryHint(savedInfo) : undefined;
+    return {
+      started: false,
+      startup: "not-attempted",
+      message:
+        `Not starting ComfyUI: ${WINDOWS_DIRECT_LAUNCH_REFUSAL}` + describeRecovery(hint),
+      auto_restart: supervisorResult(savedInfo ?? undefined),
       listener_ownership: unclassifiedOwnership(),
     };
   }
@@ -6475,6 +6531,24 @@ export async function restartComfyUI(
         describeRecovery(recoveryHint(info)),
       // Refused before touching anything: the still-running server is the one that
       // was already there, which this call did not start.
+      listener_ownership: unclassifiedOwnership(),
+    };
+  }
+  // #2947: the relaunch half of kill+relaunch is a direct spawn, refused on
+  // Windows — so the kill half must not happen either. After the validation
+  // above, so a launch that could not be rebuilt anyway still says why.
+  if (IS_WIN) {
+    const hint = recoveryHint(info);
+    return {
+      stopped: false,
+      started: false,
+      startup: "not-attempted",
+      restart_hint: hint,
+      message:
+        `Refusing to restart: ${WINDOWS_DIRECT_LAUNCH_REFUSAL} ComfyUI was left running ` +
+        "(not stopped) so you don't lose the server. Restart it from whatever launched it, " +
+        "or set COMFYUI_RESTART_COMMAND to a command that restarts it outside this process." +
+        describeRecovery(hint),
       listener_ownership: unclassifiedOwnership(),
     };
   }
