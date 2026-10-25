@@ -2004,6 +2004,36 @@ const NESTED_TERMINAL_CASES = [
     firstWriteError: STACK_DATA_CONTRADICTORY,
     message: /DaSiWa_LTX2LoraLoader/,
   },
+  {
+    // #2931 — the backend ignores `text`; a read-back cannot certify it.
+    name: "LoraManager autocomplete text",
+    widget: "text",
+    value: "<lora:style:0.8>",
+    subgraph: nestedTerminalSubgraph("text", {
+      nodeId: 2771,
+      nodeType: "Lora Loader (LoraManager)",
+      inputs: [],
+    }),
+    firstWriteError:
+      `Cannot set widget on subgraph node 78: "text" is not a promoted widget on this subgraph ` +
+      `(promoted: text).`,
+    message: /cannot set "text" on Lora Loader \(LoraManager\)/,
+  },
+  {
+    // #2933 — the H3 Easy prompt editor copies its document back over `prompt`.
+    name: "MiniMaxH3Easy editor prompt",
+    widget: "prompt",
+    value: "a new prompt",
+    subgraph: nestedTerminalSubgraph("prompt", {
+      nodeId: 2772,
+      nodeType: "MiniMaxH3Easy",
+      inputs: [],
+    }),
+    firstWriteError:
+      `Cannot set widget on subgraph node 78: "prompt" is not a promoted widget on this subgraph ` +
+      `(promoted: prompt).`,
+    message: /cannot set "prompt" on MiniMaxH3Easy/,
+  },
 ] as const;
 
 const NESTED_SAFE_SUBGRAPH = nestedTerminalSubgraph("quality_prompt", {
