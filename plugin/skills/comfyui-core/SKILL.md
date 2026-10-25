@@ -229,6 +229,11 @@ When ComfyUI is unresponsive or crashed:
 3. If restart fails (no saved process info), use `restart_comfyui` with `action: "start"` or ask the user to start it manually. On Windows `action: "start"` never launches ComfyUI (it refuses), so ask the user to start it from the Desktop app or its launcher
 4. After ComfyUI is back, re-enqueue any failed/lost workflows
 
+Before stopping ComfyUI for maintenance:
+1. Call `restart_comfyui` with `action: "status"` first. It is read-only. If `stop.recoverable_by_start` is not `"yes"`, a stop needs a person to start ComfyUI again (`stop.manual_recovery_reason` says why), so tell the user before you stop
+2. To cycle ComfyUI, use `action: "restart"`, not `stop` then `start`. Restart refuses rather than leaving ComfyUI down when it cannot bring it back
+3. Use `action: "stop"` only when ComfyUI should stay down
+
 When a job appears hung (monitor shows `[STALL]`):
 1. Check `get_system_stats` and look at VRAM usage (OOM causes hangs)
 2. Try `queue` (action:"cancel") to interrupt the stuck job

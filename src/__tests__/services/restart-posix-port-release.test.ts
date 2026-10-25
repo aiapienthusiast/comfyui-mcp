@@ -107,6 +107,7 @@ vi.mock("../../services/instance-witness.js", async () => ({
 
 import {
   __processControlTestHooks,
+  describeLifecycleStatus,
   restartComfyUI,
 } from "../../services/process-control.js";
 
@@ -839,4 +840,93 @@ describe("a local restart never abandons the instance it stopped", () => {
 
     killSpy.mockRestore();
   }, 20_000);
+});
+
+// #2948 off Windows: action:"status" reports the POSIX routes, and is just as
+// read-only — no spawn, no kill, no Manager reboot, the saved record untouched.
+describe('restart_comfyui (action:"status") on POSIX (#2948)', () => {
+  function expectNoEffects(fetchSpy?: ReturnType<typeof vi.fn>): void {
+    expect(mockSpawn).not.toHaveBeenCalled();
+    expect(
+      mockExecSync.mock.calls.some(([c]) => /\bkill\b|pkill|taskkill/i.test(String(c))),
+    ).toBe(false);
+    for (const [input, init] of (fetchSpy?.mock.calls ?? []) as [unknown, RequestInit?][]) {
+      expect(new URL(String(input)).pathname).toBe("/system_stats");
+      expect((init?.method ?? "GET").toUpperCase()).toBe("GET");
+    }
+  }
+
+  it("a validated local install: restart is kill+relaunch, and a stop is recoverable with start", async () => {
+    mockExecSync.mockImplementation((cmd: string) =>
+      /lsof/i.test(cmd) ? "p4321\nn127.0.0.1:8188\n" : "",
+    );
+    const fetchSpy = vi.fn(async () => ({ ok: true }) as Response);
+    vi.stubGlobal("fetch", fetchSpy);
+    const killSpy = vi.spyOn(process, "kill").mockImplementation(() => true);
+
+    const status = await describeLifecycleStatus();
+
+    expect(status.windows_direct_launch_blocked).toBe(false);
+    expect(status.instance).toMatchObject({ identified: "yes", pid: 4321 });
+    expect(status.start.launches).toBe("no"); // already running: start is a no-op
+    expect(status.stop).toMatchObject({ allowed: "yes", recoverable_by_start: "yes" });
+    expect(status.restart).toMatchObject({
+      route: "kill-relaunch",
+      will_attempt: "yes",
+      evidence: "validated-command",
+    });
+    expectNoEffects(fetchSpy);
+    // Signal 0 is an existence probe; nothing may be SENT a real signal.
+    expect(killSpy.mock.calls.every(([, sig]) => sig === 0)).toBe(true);
+    expect(__processControlTestHooks.getLastProcessInfo()).toBeNull();
+    killSpy.mockRestore();
+  });
+
+  it("a remote target: Manager reboot with UNVERIFIED recovery, local actions unavailable, nothing contacted", async () => {
+    mockConfig.remoteMode = true;
+    mockConfig.baseUrl = "http://remote.example:8188";
+    const fetchSpy = vi.fn(async () => ({ ok: true }) as Response);
+    vi.stubGlobal("fetch", fetchSpy);
+
+    const status = await describeLifecycleStatus();
+
+    expect(status.target.remote).toBe(true);
+    expect(status.restart).toMatchObject({
+      route: "comfyui-manager-remote",
+      will_attempt: "yes",
+      evidence: "unverified-remote",
+    });
+    expect(status.start.launches).toBe("no");
+    expect(status.stop).toMatchObject({ allowed: "no", recoverable_by_start: "not-applicable" });
+    expect(status.instance.identified).toBe("unknown");
+    expect(fetchSpy).not.toHaveBeenCalled();
+    expect(mockGetSystemStats).not.toHaveBeenCalled();
+    expectNoEffects();
+  });
+
+  it("nothing running but a saved launch record that validates: start would launch it, and the record is unchanged", async () => {
+    mockGetSystemStats.mockRejectedValue(new Error("fetch failed"));
+    mockExecSync.mockImplementation((cmd: string) => {
+      if (/lsof/i.test(cmd)) throw lsofNoMatches();
+      if (/pgrep/i.test(cmd)) throw Object.assign(new Error("no match"), { status: 1 });
+      return "";
+    });
+    __processControlTestHooks.setLastProcessInfo({
+      pid: 4321,
+      port: 8188,
+      argv: ARGV,
+      isDesktopApp: false,
+    });
+    const saved = __processControlTestHooks.getLastProcessInfo();
+    const snapshot = JSON.stringify(saved);
+
+    const status = await describeLifecycleStatus();
+
+    expect(status.instance.identified).toBe("no");
+    expect(status.start.launches).toBe("yes");
+    expect(status.restart.will_attempt).toBe("no");
+    expectNoEffects();
+    expect(__processControlTestHooks.getLastProcessInfo()).toBe(saved);
+    expect(JSON.stringify(__processControlTestHooks.getLastProcessInfo())).toBe(snapshot);
+  });
 });

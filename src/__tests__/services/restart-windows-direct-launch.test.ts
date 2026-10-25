@@ -38,6 +38,9 @@ const hoisted = vi.hoisted(() => ({
   existsSync: vi.fn((_p: string) => false),
   findComfyuiPython: vi.fn(),
   resolveBase: vi.fn<[], string | undefined>(),
+  resetClient: vi.fn(),
+  /** Every filesystem WRITE the code could make lands here (#2948 read-only checks). */
+  fsWrite: vi.fn(),
 }));
 
 vi.mock("node:os", async (importOriginal) => {
@@ -78,11 +81,18 @@ vi.mock("node:fs", () => ({
     if (!hoisted.existsSync(String(p))) throw new Error("ENOENT");
     return { isFile: () => true, isDirectory: () => false };
   }),
+  writeFileSync: (...args: unknown[]) => hoisted.fsWrite("writeFileSync", ...args),
+  appendFileSync: (...args: unknown[]) => hoisted.fsWrite("appendFileSync", ...args),
+  mkdirSync: (...args: unknown[]) => hoisted.fsWrite("mkdirSync", ...args),
+  openSync: (...args: unknown[]) => hoisted.fsWrite("openSync", ...args),
+  renameSync: (...args: unknown[]) => hoisted.fsWrite("renameSync", ...args),
+  rmSync: (...args: unknown[]) => hoisted.fsWrite("rmSync", ...args),
+  unlinkSync: (...args: unknown[]) => hoisted.fsWrite("unlinkSync", ...args),
 }));
 
 vi.mock("../../comfyui/client.js", () => ({
   getSystemStats: hoisted.getSystemStats,
-  resetClient: vi.fn(),
+  resetClient: hoisted.resetClient,
   resetObjectInfoCache: vi.fn(),
 }));
 
@@ -109,6 +119,7 @@ vi.mock("../../services/instance-witness.js", async () => ({
 
 import {
   __processControlTestHooks,
+  describeLifecycleStatus,
   preflightLocalRestart,
   restartComfyUI,
   startComfyUI,
@@ -466,6 +477,7 @@ describe('restart_comfyui (action:"stop") on Windows stays an explicit, truthful
     expect(result.stopped).toBe(true);
     expect(result.message).toContain("6789");
     expect(killsIssued().some((cmd) => /taskkill/i.test(cmd))).toBe(true);
+    expect(hoisted.resetClient).toHaveBeenCalled();
     expect(hoisted.spawn).not.toHaveBeenCalled();
   });
 
@@ -474,5 +486,166 @@ describe('restart_comfyui (action:"stop") on Windows stays an explicit, truthful
     expect(out.enabled).toBe(true);
     expect(out.supported).toBe(false);
     expect(out.message).toMatch(REFUSAL);
+  });
+});
+
+// #2948: maintenance callers must learn BEFORE an explicit stop whether this tool
+// can bring ComfyUI back. action:"status" answers that, and must itself change
+// nothing: no spawn, no kill, no Manager reboot, no queue call, no exec, no file
+// write, and the saved launch record left exactly as it was.
+describe('restart_comfyui (action:"status") on Windows is read-only and truthful (#2948)', () => {
+  /** Every observable effect a status call must NOT have. */
+  function expectNoEffects(fetchSpy?: ReturnType<typeof vi.fn>): void {
+    expect(hoisted.spawn).not.toHaveBeenCalled();
+    expect(hoisted.exec).not.toHaveBeenCalled();
+    expect(killsIssued()).toEqual([]);
+    expect(hoisted.fsWrite).not.toHaveBeenCalled();
+    expect(hoisted.resetClient).not.toHaveBeenCalled();
+    for (const [input, init] of (fetchSpy?.mock.calls ?? []) as [unknown, RequestInit?][]) {
+      // Only identity reads: GET /system_stats. No reboot, queue, interrupt or POST.
+      expect(new URL(String(input)).pathname).toBe("/system_stats");
+      expect((init?.method ?? "GET").toUpperCase()).toBe("GET");
+    }
+  }
+
+  it("the Windows Python mismatch: preflight passes, but status says restart refuses and stop needs manual recovery", async () => {
+    pythonInstall();
+    const fetchSpy = stubFetch();
+    const savedBefore = __processControlTestHooks.getLastProcessInfo();
+
+    const pre = await preflightLocalRestart();
+    const status = await describeLifecycleStatus();
+
+    // The Manager-reboot preflight is not the answer a maintenance caller needs.
+    expect(pre.ok).toBe(true);
+    expect(status.read_only).toBe(true);
+    expect(status.windows_direct_launch_blocked).toBe(true);
+    expect(status.instance).toMatchObject({ identified: "yes", pid: 4321, desktop: false });
+    expect(status.start.launches).toBe("no");
+    expect(status.start.reason).toMatch(REFUSAL);
+    expect(status.stop.allowed).toBe("yes");
+    expect(status.stop.recoverable_by_start).toBe("no");
+    expect(status.stop.manual_recovery_reason).toMatch(REFUSAL);
+    expect(status.stop.restart_hint?.server_argv).toEqual(SERVER_ARGV);
+    expect(status.restart).toMatchObject({ route: "none", will_attempt: "no", evidence: "none" });
+    expect(status.restart.reason).toMatch(REFUSAL);
+    expect(status.auto_restart.supported).toBe(false);
+    expect(status.limits.join(" ")).toMatch(/comfy_cli/);
+    expect(status.summary).toMatch(/MANUAL recovery/);
+    expect(status.summary).toMatch(/restart would refuse/);
+    expectNoEffects(fetchSpy);
+    expect(__processControlTestHooks.getLastProcessInfo()).toBe(savedBefore);
+  });
+
+  it("a verified Desktop supervisor: restart goes through Manager (verified), stop still needs the Desktop app", async () => {
+    desktopServer();
+    __processControlTestHooks.setProcessIdentityResolver((pid) => {
+      if (pid === 4321) return { startedAt: "5000", parentPid: 300 };
+      if (pid === 300) {
+        return {
+          commandLine: `"${DESKTOP_SHELL}"`,
+          argv: [DESKTOP_SHELL],
+          executablePath: DESKTOP_SHELL,
+          startedAt: "2000",
+        };
+      }
+      return undefined;
+    });
+    const fetchSpy = stubFetch();
+
+    const status = await describeLifecycleStatus();
+
+    expect(status.instance).toMatchObject({ identified: "yes", desktop: true });
+    expect(status.restart).toMatchObject({
+      route: "comfyui-manager-desktop",
+      will_attempt: "yes",
+      evidence: "verified-supervisor",
+    });
+    expect(status.stop.recoverable_by_start).toBe("no");
+    expect(status.stop.manual_recovery_reason).toMatch(/Desktop app/);
+    expect(rebootsSent(fetchSpy)).toEqual([]);
+    expectNoEffects(fetchSpy);
+  });
+
+  it("an INFERRED Desktop supervisor (#1647) is reported as inferred, with its caveat — never as verified", async () => {
+    desktopServer();
+    // The first parent hop cannot be read at all; only the Desktop launch arguments speak.
+    __processControlTestHooks.setParentPidResolver(() => undefined);
+    __processControlTestHooks.setProcessIdentityResolver((pid) =>
+      pid === 4321 ? { startedAt: "5000" } : undefined,
+    );
+    const fetchSpy = stubFetch();
+
+    const status = await describeLifecycleStatus();
+
+    expect(status.restart.route).toBe("comfyui-manager-desktop");
+    expect(status.restart.evidence).toBe("inferred-supervisor");
+    expect(status.restart.reason).toMatch(/INFERRED, not proven/);
+    expect(status.limits.join(" ")).toMatch(/started this server BY HAND/);
+    expectNoEffects(fetchSpy);
+  });
+
+  it("the #1847 self-relaunch shape reports a refusing restart, not a Manager route", async () => {
+    desktopServer();
+    __processControlTestHooks.setProcessIdentityResolver((pid) =>
+      pid === 4321 ? { startedAt: "5000", parentPid: 300 } : undefined,
+    );
+    hoisted.existsSync.mockImplementation((p: string) =>
+      [PY, MAIN, DESKTOP_MODELS].includes(String(p)),
+    );
+    const fetchSpy = stubFetch();
+
+    const status = await describeLifecycleStatus();
+
+    expect(status.restart).toMatchObject({ route: "none", will_attempt: "no", evidence: "none" });
+    expect(status.restart.reason).toMatch(REFUSAL);
+    expectNoEffects(fetchSpy);
+  });
+
+  it("COMFYUI_RESTART_COMMAND is reported as user-configured, NOT run, and claims no isolation", async () => {
+    pythonInstall();
+    hoisted.config.comfyuiRestartCommand = "sc.exe stop ComfyUI && sc.exe start ComfyUI";
+    const fetchSpy = stubFetch();
+
+    const status = await describeLifecycleStatus();
+
+    expect(status.restart).toMatchObject({
+      route: "configured-command",
+      will_attempt: "yes",
+      evidence: "user-configured",
+    });
+    expect(status.limits.join(" ")).toMatch(/not verified here/);
+    // The configured command does not make an explicit stop recoverable by start.
+    expect(status.stop.recoverable_by_start).toBe("no");
+    expectNoEffects(fetchSpy);
+  });
+
+  it("nothing running: stop and restart refuse, and nothing is identified", async () => {
+    hoisted.getSystemStats.mockRejectedValue(new Error("fetch failed"));
+    hoisted.execSync.mockImplementation(() => "");
+
+    const status = await describeLifecycleStatus();
+
+    expect(status.instance.identified).toBe("no");
+    expect(status.stop).toMatchObject({ allowed: "no", recoverable_by_start: "not-applicable" });
+    expect(status.restart).toMatchObject({ route: "none", will_attempt: "no" });
+    expect(status.start.launches).toBe("no");
+    expectNoEffects();
+  });
+
+  it("an answering server whose PID cannot be mapped is UNKNOWN — never promoted to a supported route", async () => {
+    // /system_stats answers, but no port→PID lookup resolves (the #449 shape).
+    hoisted.getSystemStats.mockResolvedValue({ system: { argv: SERVER_ARGV } });
+    hoisted.execSync.mockImplementation(() => "");
+    const fetchSpy = stubFetch();
+
+    const status = await describeLifecycleStatus();
+
+    expect(status.instance.identified).toBe("unknown");
+    expect(status.instance.detail).toBeTruthy();
+    expect(status.stop.allowed).toBe("no");
+    expect(status.restart.will_attempt).toBe("no");
+    expect(status.restart.evidence).toBe("none");
+    expectNoEffects(fetchSpy);
   });
 });
